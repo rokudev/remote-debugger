@@ -4,11 +4,13 @@ The Roku Remote Debugger is a Python-based sample commad-line remote debugger fo
 
 To run the Roku Remote Debugger, follow these steps: 
 
-1. Verify that you have Python 3.5.2 (or greater) installed on your machine.
+1. Download and then extract the debugger.
 
-2. [Create a ZIP file](docs/developer-program/getting-started/hello-world.md#compressing-the-contents-of-the-hello-world-directory) containing the development channel to be tested. You can also [download sample channels](https://github.com/rokudev/samples) to test with the debugger.
+2. Verify that you have Python 3.5.2 (or greater) installed on your machine.
 
-3. Sideload a channel by entering the following command in a terminal or command prompt:
+3. [Create a ZIP file](docs/developer-program/getting-started/hello-world.md#compressing-the-contents-of-the-hello-world-directory) containing the development channel to be tested. You can also [download sample channels](https://github.com/rokudev/samples) to test with the debugger.
+
+4. Sideload a channel by entering the following command in a terminal or command prompt:
 
    `python rokudebug.py --targetip <Roku device IP address> --targetpass <Roku device webserver password> <development channel zip file>` 
 
@@ -16,7 +18,7 @@ To run the Roku Remote Debugger, follow these steps:
 
    `python3 rokudebug.py --targetip 192.168.1.10 --targetpass abcd VideoListExample/Archive.zip`
 
-4. Enter **help** to view a list of the available debug commands, which are as follows:
+5. Enter **help** to view a list of the available debug commands, which are as follows:
 
    | Command   | Abbreviation | Description                                         |
    | --------- | ------------ | --------------------------------------------------- |
