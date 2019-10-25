@@ -1,6 +1,6 @@
 ## Roku Remote Debugger
 
-The Roku Remote Debugger is a Python-based sample commad-line remote debugger for testing and debugging Roku channels under development. The Roku Remote Debugger (**rokudebug.py**) provides the same functionality as the BrightScript debug console; however, it demonstrates how the BrightScript debug protocol can be used to integrate a remote debug tool into an IDE.
+The Roku Remote Debugger is a Python-based sample commad-line remote debugger for testing and debugging Roku channels under development. The Roku Remote Debugger (**rokudebug.py**) provides the same functionality as the [BrightScript debug console](https://developer.roku.com/docs/developer-program/debugging/debugging-channels.md#brightscript-console-port-8085-commands); however, it demonstrates how the BrightScript debug protocol could be used to integrate a remote debugger into an IDE.
 
 To run the Roku Remote Debugger, follow these steps: 
 
