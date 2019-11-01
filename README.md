@@ -27,7 +27,7 @@ To run the Roku Remote Debugger, follow these steps:
    | down      | d            | Move one frame down the function call stack.        |
    | help      | h            | Print the available commands.                       |
    | list      | l            | List the currently running function.                |
-   | print *var*     |              | Print the value of a specific variable. The variable name must be lowercased. For example, to print a variable named MYVAR, enter `print myvar`.                     |
+   | print *var*     |              | Print the value of a specific variable.               |
    | quit      | q            | Quit the Roku Remote Debugger and exit the channel. |
    | status    |              | Show the status of the Roku Remote Debugger.        |
    | stop      |              | Stop all threads.                                   |
