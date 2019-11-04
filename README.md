@@ -8,7 +8,7 @@ To run the Roku Remote Debugger, follow these steps:
 
 2. Verify that you have Python 3.5.3 (or greater) installed on your machine.
 
-3. [Create a ZIP file](docs/developer-program/getting-started/hello-world.md#compressing-the-contents-of-the-hello-world-directory) containing the development channel to be tested. You can also [download sample channels](https://github.com/rokudev/samples) to test with the debugger.
+3. [Create a ZIP file](https://developer.roku.com/docs/developer-program/getting-started/hello-world.md#compressing-the-contents-of-the-hello-world-directory) containing the development channel to be tested. You can also [download sample channels](https://github.com/rokudev/samples) to test with the debugger.
 
 4. Sideload a channel by entering the following command in a terminal or command prompt:
 
