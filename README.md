@@ -20,21 +20,29 @@ To run the Roku Remote Debugger, follow these steps:
 
 5. Enter **help** to view a list of the available debug commands, which are as follows:
 
-   | Command   | Abbreviation | Description                                         |
-   | --------- | ------------ | --------------------------------------------------- |
-   | backtrace | bt           | Print stack backtrace of selected thread.           |
-   | continue  | c            | Continue all threads.                               |
-   | down      | d            | Move one frame down the function call stack.        |
-   | help      | h            | Print the available commands.                       |
-   | list      | l            | List the currently running function.                |
-   | print *var*     |              | Print the value of a specific variable.               |
-   | quit      | q            | Quit the Roku Remote Debugger and exit the channel. |
-   | status    |              | Show the status of the Roku Remote Debugger.        |
-   | stop      |              | Stop all threads.                                   |
-   | thread    | th           | Inspect a thread.                                   |
-   | threads   | ths          | Show all threads.                                   |
-   | up        | u            | Move one frame up the function call stack.          |
-   | vars      | v            | Show the variables in the current scope.            |
+      | Command                | Abbreviation | Description                                         |
+   | ---------------------- | ------------ | --------------------------------------------------- |
+   | addbreak               | break, ab    | Adds a breakpoint                                   |
+   | backtrace              | bt           | Print stack backtrace of selected thread.           |
+   | continue               | c            | Continue all threads.                               |
+   | down                   | d            | Move one frame down the function call stack.        |
+   | help                   | h            | Print the available commands.                       |
+   | list                   | l            | List the currently running function.                |
+   | listbreak              | Lb           | List all breakpoints                                |
+   | out                    | o            | Step out of the current function                    |
+   | over                   | v            | Step over one program statement                     |
+   | print *var*            |              | Print the value of a specific variable.             |
+   | rmbreak *breakpointid* | rb           | Clears the specified breakpoint                     |
+   | quit                   | q            | Quit the Roku Remote Debugger and exit the channel. |
+   | status                 |              | Show the status of the Roku Remote Debugger.        |
+   | step                   | s, t         | Step one program statement                          |
+   | stop                   |              | Stop all threads.                                   |
+   | thread                 | th           | Inspect a thread.                                   |
+   | threads                | ths          | Show all threads.                                   |
+   | up                     | u            | Move one frame up the function call stack.          |
+   | vars                   | v            | Show the variables in the current scope.            |
+
+
 ***
  Copyright 2019 Roku, Inc.
 
