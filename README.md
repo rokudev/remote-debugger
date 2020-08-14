@@ -42,6 +42,15 @@ To run the Roku Remote Debugger, follow these steps:
    | up                     | u            | Move one frame up the function call stack.          |
    | vars                   | v            | Show the variables in the current scope.            |
 
+## [BETA] Visual Studio Code extension
+
+You can [download](https://github.com/rokudev/debug-protocol-vscode-ext-beta) the beta version of the Visual Studio Code extension for the Roku BrightScript debug protocol. After extracting and installing the extension, you can use it for debugging Roku channels in Visual Studio.
+
+## Change log
+
+- **08-14-2020**: Beta release of [Visual Studio Code extension](https://github.com/rokudev/debug-protocol-vscode-ext-beta). Updated debug command table.
+- **03-29-2020**: Roku Remote debugger 2.0.0 release. Added breakpoint and step commands.  
+- **11-09-2019**: Roku Remote debugger 1.0.1 release. 
 
 ***
  Copyright 2019 Roku, Inc.
