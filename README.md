@@ -1,10 +1,10 @@
 ## Roku Remote Debugger
 
-The Roku Remote Debugger is a Python-based sample commad-line remote debugger for testing and debugging Roku channels under development. The Roku Remote Debugger (**rokudebug.py**) provides the same functionality as the [BrightScript debug console](https://developer.roku.com/docs/developer-program/debugging/debugging-channels.md#brightscript-console-port-8085-commands); however, it demonstrates how the BrightScript debug protocol could be used to integrate a remote debugger into an IDE.
+The Roku Remote Debugger is a Python-based reference implementation of a command-line remote debugger for testing and debugging Roku channels under development. The Roku Remote Debugger (**rokudebug.py**) provides the same functionality as the [BrightScript debug console](https://developer.roku.com/docs/developer-program/debugging/debugging-channels.md#brightscript-console-port-8085-commands); however, it demonstrates how the BrightScript debug protocol could be used to integrate a remote debugger into an IDE.
 
 To run the Roku Remote Debugger, follow these steps: 
 
-1. Download and then extract the debugger.
+1. Download or clone this project
 
 2. Verify that you have Python 3.5.3 (or greater) installed on your machine.
 
@@ -48,16 +48,16 @@ You can [download](https://github.com/rokudev/debug-protocol-vscode-ext-beta) th
 
 ## Change log
 
+- **09-14-2022**: Roku Remote debugger 3.1.0 release. Supports protocol 3.1.0 features (conditional breakpoints, packet length, improved error responses)
 - **08-14-2020**: Beta release of [Visual Studio Code extension](https://github.com/rokudev/debug-protocol-vscode-ext-beta). Updated debug command table.
 - **03-29-2020**: Roku Remote debugger 2.0.0 release. Added breakpoint and step commands.  
 - **11-09-2019**: Roku Remote debugger 1.0.1 release. 
 
 ***
- Copyright 2019 Roku, Inc.
+ Copyright 2019-2022 Roku, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at
 
 http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
- ***
