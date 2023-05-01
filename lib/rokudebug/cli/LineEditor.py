@@ -33,6 +33,9 @@ _module_debug_level = 0
 
 import atexit, re, sys, threading, traceback
 
+# SystemExit only exits the current thread, so call it by its real name
+ThreadExit = SystemExit
+
 global_config = getattr(sys.modules['__main__'], 'global_config', None)
 assert global_config
 
@@ -72,7 +75,7 @@ class LineEditor(object):
     # may be empty if there are no completions.
     def __init__(self, controller):
         self.__self_debug_level = 0
-        if self._debug_level() >= 5:
+        if self.__check_debug(5):
             print('debug: lined: init()')
 
         global _platform_has_tab_completion
@@ -117,9 +120,9 @@ class LineEditor(object):
                 except EOFError:
                     if _platform_has_readline:
                         line = readline.get_line_buffer()
-                        if self._debug_level() >= 2:
+                        if self.__check_debug(2):
                             print('debug: aborted text: "{}"'.format(line))
-            if self._debug_level() >= 5:
+            if self.__check_debug(5):
                 print('debug: lined: edit() done: "{}"'.format(line))
         finally:
             if _platform_has_readline:
@@ -170,16 +173,18 @@ class LineEditor(object):
                 format(token_dicts, selected_idx))
         return token_dicts, selected_idx
 
-    # Called repeatedly by readline module,  with state=0,1,2,3,... If
-    # there are multiple potential completions, one should be returned
-    # with each state. When None is returned, the potential completions
-    # are shown to the user. if only state=0 returns a string, that is
-    # applied to the text being edited.
+    # NB: 'state' is an index into a list of completions. That name is
+    # confusing, so it is named 'completion_index' here.
+    #
+    # Called repeatedly by readline module, with completion_index=0,1,2,...
+    # Caling with completion_index==0 generates a list of possible completions,
+    # discarding any previous list. Each subsequent call returns the next
+    # completion and None when the list is exhausted.
     def __completer(self, text, state):
         completion_index = state        # 'state' is an oddly-named parameter
         state = None                    # reduce naming ambiguity
-        if self._debug_level() >= 5:
-            print('debug: completer: compidx={},text={}'.format(
+        if self.__check_debug(5):
+            print('debug: lined: compidx={},text={}'.format(
                 completion_index, text))
         try:
             if not completion_index:
@@ -192,10 +197,11 @@ class LineEditor(object):
                 self.__state = _LineEditorState(line, idx0, idx1,
                                     self.__controller.get_completions(
                                         line, idx0, idx1))
-                if self._debug_level() >= 5:
+                if self.__check_debug(5):
                     self.__state.dump()
         except Exception:
-            if self._debug_level() >= 1:
+            if self.__check_debug(2):
+                print('debug: lined: exeption occurred:')
                 traceback.print_exc()
             raise
 
@@ -206,13 +212,15 @@ class LineEditor(object):
             # done
             self.__state = None
 
-        if self._debug_level() >= 5:
+        if self.__check_debug(5):
             print('debug: lined: completer({}) => {}'.format(
                 completion_index, completion))
         return completion
 
-    def _debug_level(self):
-        return max(global_config.debug_level, self.__self_debug_level)
+    def __check_debug(self, min_level):
+        lvl = max(global_config.debug_level, _module_debug_level,
+                  self.__self_debug_level)
+        return lvl >= min_level
 
     def _restore_tty(self):
         if self.__saved_tty_attrs:
@@ -332,7 +340,7 @@ if bool(__name__ == '__main__'):
         def __call__(self):
             try:
                 test_driver()
-            except SystemExit: raise
+            except ThreadExit: raise
             except: # Yes, catch EVERYTHING
                 print('INTERNAL ERROR: uncaught exception', file=sys.stderr)
                 sys.exit(1)

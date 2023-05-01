@@ -31,6 +31,9 @@
 
 import enum, sys, traceback
 
+# SystemExit only exits the current thread, so call it by its real name
+ThreadExit = SystemExit
+
 from .DebuggerRequest import CmdCode
 from .DebugUtils import do_exit, get_enum_name, get_file_name
 from .ProtocolVersion import ProtocolFeature
@@ -92,6 +95,8 @@ class UpdateType(enum.IntEnum):
     THREAD_ATTACHED = 3,
     BREAKPOINT_ERROR = 4,
     COMPILE_ERROR = 5,
+    BREAKPOINT_VERIFIED = 6,
+    PROTOCOL_ERROR = 7,
 
     COMMAND_RESPONSE = 99,      # Not part of protocol
 
@@ -167,6 +172,17 @@ class ThreadStopReason(enum.IntEnum):
         return s
 
 
+@enum.unique
+class ProtocolError(enum.IntEnum):
+    IO_PORT_FAIL = 1,	# thread is running
+
+    # enums do not follow the normal rules, regarding str.format().
+    # Specifically, str.format() does not call str() for enums and
+    # always includes the int value only, in the formatted string.
+    # str(obj) does call this
+    def __str__(self):
+        return repr(self)
+
 # Set of types that are always containers (those that have sub-elements)
 _g_container_types = {
     VariableType.AA,
@@ -181,8 +197,8 @@ _g_maybe_container_types = {
 
 
 # A DebuggerUpdate can be an asynchronous event (e.g., script crashed)
-# or a response to a request. Unrequested updates have requestID=0,
-# and responses have requestID>0
+# or a response to a request. Unrequested updates have request_id==0,
+# and responses have request_id>0
 class DebuggerUpdate(object):
     def __init__(self):
         super(DebuggerUpdate,self).__init__()
@@ -244,9 +260,19 @@ class DebuggerUpdate(object):
     # If the request is not related to a request, getRequestID()
     # on the response will return 0 and getRequest() will return None.
     # Upon return, the matching request will have been removed from
-    # the debuggerListener's pending request list.
+    # the debugger_listener's pending request list.
+    # @return DebuggerUpdate subclass or None on EOF
     @staticmethod
-    def read_update(debugger_client, debuggerListener):
+    def read_update(debugger_client, debugger_listener):
+        update = None
+        try:
+            update = DebuggerUpdate.__read_update_impl(debugger_client,
+                                                       debugger_listener)
+        except EOFError: pass
+        return update
+
+    @staticmethod
+    def __read_update_impl(debugger_client, debugger_listener):
         debug_level = global_config.debug_level
         dclient = debugger_client
 
@@ -269,7 +295,7 @@ class DebuggerUpdate(object):
         request = None
         if update.request_id:
             update.update_type = UpdateType.COMMAND_RESPONSE
-            request = debuggerListener.get_pending_request(
+            request = debugger_listener.get_pending_request(
                                         update.request_id, True)
         update.request = request  # Could be None
 
@@ -332,6 +358,9 @@ class DebuggerUpdate(object):
                 elif update.update_type == UpdateType.BREAKPOINT_ERROR:
                     update = DebuggerUpdate_BreakpointError(
                         debugger_client, update)
+                elif update.update_type == UpdateType.BREAKPOINT_VERIFIED:
+                    update = DebuggerUpdate_BreakpointVerified(
+                        debugger_client, update)
                 elif update.update_type == UpdateType.COMPILE_ERROR:
                     update = DebuggerUpdate_CompileError(
                         debugger_client, update)
@@ -340,6 +369,9 @@ class DebuggerUpdate(object):
                         debugger_client, update)
                 elif update.update_type == UpdateType.THREAD_ATTACHED:
                     update = DebuggerUpdate_ThreadAttached(
+                        debugger_client, update)
+                elif update.update_type == UpdateType.PROTOCOL_ERROR:
+                    update = DebuggerUpdate_ProtocolError(
                         debugger_client, update)
                 else:
                     do_exit(1, 'Bad update_type from target: {}'.format(
@@ -359,7 +391,7 @@ class DebuggerUpdate(object):
         # cause a THREAD_ATTACHED or ALL_THREADS_STOPPED update later.
         if update.update_type and not update.request_id:
             update.request = \
-                debuggerListener.get_pending_request_by_update_type(
+                debugger_listener.get_pending_request_by_update_type(
                     update.update_type, True)
 
         if global_config.debug_level >= 1: # 1 = validation
@@ -385,7 +417,7 @@ class DebuggerUpdate(object):
             s = s + ',request={}'.format(self.request)
         return s
 
-    # parameters inside the response to __str__()
+    # parameters inside a larger string, such as the return from __str__()
     def str_params(self):
         s = 'len={}/{},reqid={},errcode={}'.format(
             self.byte_read_count,
@@ -577,7 +609,7 @@ class DebuggerResponse_Execute(DebuggerUpdate):
     def str_params(self):
         s = '{},runsuccess={},runstopcode={},numcompileerrs={},numrunerrs={},numothererrs={}'.format(
                 super(DebuggerResponse_Execute, self).str_params(),
-                get_enum_name(self.run_success), get_enum_name(self.run_stop_code),
+                self.run_success, get_enum_name(self.run_stop_code),
                 len(self.compile_errors), len(self.runtime_errors), len(self.other_errors))
         return s
 
@@ -764,12 +796,12 @@ class DebuggerResponse_Stacktrace(DebuggerUpdate):
     # parameters inside the response to __str__()
     def str_params(self):
         s = super(DebuggerResponse_Stacktrace, self).str_params()
-        s += ",threads=["
+        s += ",frames=["
         needComma = False
         for frame in self.frames:
             if needComma: s += ','
             else: needComma = True
-            s += frame.str_params()
+            s += '[{}]'.format(frame.str_params())
         s += ']'
         return s
 
@@ -882,6 +914,14 @@ class DebuggerResponse_Threads(DebuggerUpdate):
             s += '[' + info.str_params(False) + ']'
         s += ']'
         return s
+
+    def get_primary_thread(self) -> object:
+        primary = None
+        for thread in self.threads:
+            if thread.is_primary:
+                primary = thread
+                break
+        return primary
 
     def dump(self, out):
         num_threads = len(self.threads)
@@ -1644,6 +1684,33 @@ class DebuggerUpdate_ThreadAttached(DebuggerUpdate):
             self.stop_reason_detail)
         return s
 
+class DebuggerUpdate_ProtocolError(DebuggerUpdate):
+    # Finish reading the response that was started in baseResponse
+    # The returned response is a new object that has a copy of all
+    # relevent information from base_response
+    def __init__(self, debugger_client, base_response):
+        super(DebuggerUpdate_ProtocolError, self).__init__()
+        dc = debugger_client
+        self._copy_from(base_response)
+        self.flags = dc.recv_int32(self)
+        error_int = dc.recv_int32(self)
+        try:
+            self.error_code = ProtocolError(error_int)
+        except ValueError:
+            do_exit(1, 'Bad value for protocol_error from target: {}'.format(
+                error_int))
+
+    # raises AssertionError if things are not right
+    def _validate(self):    # class DebuggerUpdate_ProtocolError
+        super(DebuggerUpdate_ProtocolError, self)._validate()
+        assert self.error_code
+
+    def str_params(self):
+        s = '{},flags{},error_code={}'.format(
+            super(DebuggerUpdate_ProtocolError, self).str_params(),
+            self.flags, self.error_code)
+        return s
+
 def _format_var_info_flags(info_flags):
     assert (info_flags == None) or isinstance(info_flags, int)
     if not info_flags:
@@ -1667,3 +1734,35 @@ def get_stop_reason_str_for_user(stop_reason, stop_reason_detail):
         s += ': '
         s += stop_reason_detail
     return s
+
+class DebuggerUpdate_BreakpointVerified(DebuggerUpdate):
+    # Finish reading the response that was started in baseResponse
+    # The returned response is a new object that has a copy of all
+    # relevent information from baseResponse
+    def __init__(self, debugger_client, baseResponse):
+        super(DebuggerUpdate_BreakpointVerified, self).__init__()
+        dc = debugger_client
+        self._copy_from(baseResponse)
+        self.flags = dc.recv_uint32(self)
+        self.breakpoint_num = dc.recv_uint32(self)
+
+        self.breakpoint_ids = []
+        for i in range(self.breakpoint_num):
+            self.breakpoint_ids.append(dc.recv_uint32(self))
+
+        if self.__check_debug(1):
+            self._validate()
+
+    def str_params(self):
+        s = super(DebuggerUpdate_BreakpointVerified, self).str_params()
+        s += ',breakpoint_ids={}'.format(\
+            self.breakpoint_ids)
+        return s
+
+    def _validate(self):
+        super(DebuggerUpdate_BreakpointVerified, self)._validate()
+        assert self.breakpoint_ids
+        assert len(self.breakpoint_ids) > 0
+
+    def __check_debug(self, min_level):
+        return global_config.debug_level >= min_level

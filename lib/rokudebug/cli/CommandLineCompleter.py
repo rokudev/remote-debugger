@@ -50,7 +50,7 @@ class CompletionDomain(enum.IntEnum):
 class CommandLineCompleter(object):
 
     def __init__(self, cli):
-        self.__debug_level = max(global_config.debug_level, 0)
+        self.__debug_level = 0
         self.__lock = threading.Lock()
         self.__cli = cli
         self.__completion_domain = CompletionDomain.COMMAND_LINE
@@ -117,7 +117,7 @@ class CommandLineCompleter(object):
 
     # @param token:string may be empty but never None
     def __complete_command(self, token):
-        if self.__check_debug(3):
+        if self.__check_debug(5):
             print('debug: clc: complete_command(),token={}'.format(token))
         completions = list()
 
@@ -142,8 +142,7 @@ class CommandLineCompleter(object):
             print('debug: clc: complete_file("{}")'.format(token))
         completions = list()
         cmp_token = token.casefold()
-        for file_path in self.__cli._src_inspector.get_source_file_paths():
-            file_path = 'pkg:/' + file_path
+        for file_path in self.__cli._src_inspector.get_all_source_file_specs():
             if cmp_token in file_path.casefold():
                 completions.append(file_path)
 
@@ -162,5 +161,4 @@ class CommandLineCompleter(object):
 
     def __check_debug(self, min_level):
         lvl = max(global_config.debug_level, self.__debug_level)
-        if lvl: assert global_config.debug_level >= 0 and self.__debug_level >= 0 and min_level >= 1
         return lvl >= min_level

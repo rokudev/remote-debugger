@@ -24,7 +24,7 @@
 # _protected members begin with a single underscore '_' (subclasses can access)
 # __private members begin with double underscore: '__'
 #
-# python more or less enfores the double-underscore as private
+# python more or less enforces the double-underscore as private
 # by prepending the class name to those identifiers. That makes
 # it difficult (but not impossible) for other classes to access
 # those identifiers.
@@ -35,13 +35,6 @@ from .ProtocolVersion import ProtocolFeature
 
 global_config = getattr(sys.modules['__main__'], 'global_config', None)
 assert global_config    # verbosity, global debug_level
-
-UINT8_SIZE = 1
-UINT32_SIZE = 4
-
-# Size in bytes of a simple request with no parameters:
-#    - packetSize,requestID,cmdCode
-NO_PARAMS_REQUEST_SIZE = (3 * UINT32_SIZE)
 
 @enum.unique
 class CmdCode(enum.IntEnum):
@@ -59,6 +52,10 @@ class CmdCode(enum.IntEnum):
     ADD_CONDITIONAL_BREAKPOINTS = 11,
 
     EXIT_CHANNEL = 122,
+
+    # Not defined in protocol - This is used by tests loaded at runtime to
+    # send commands this client does not know about.
+    CUSTOM = -1
 
     # string displayable to an end user
     def to_user_str(self):
@@ -82,22 +79,48 @@ class _VariablesRequestFlags(enum.IntEnum):
 # Abstract base class of all debugger requests
 class DebuggerRequest(object):
 
+    UINT8_SIZE = 1
+    UINT32_SIZE = 4
+
+    # Size in bytes of a simple request with no parameters:
+    #    - packetSize,requestID,cmdCode
+    NO_PARAMS_REQUEST_SIZE = (3 * UINT32_SIZE)
+
     # All debugger requests have a caller_data attribute. caller_data
     # is an opaque value that is ignored by the debugger client, and the
     # caller can manipulate that data at will
-    def __init__(self, cmd_code, caller_data=None):
+    # @raise ValueError if custom_cmd_code_int is set but cmd_code!=CUSTOM
+    def __init__(self, cmd_code, custom_cmd_code_int=None, caller_data=None):
         self.__local_debug_level = 0
         self.__packet_size = None
         self._protocol_version = None
         self.cmd_code = cmd_code
+        self.custom_cmd_code_int = custom_cmd_code_int
         self.request_id = None          # Set when sent to debuggee
         self.caller_data = caller_data
+
+        if self.cmd_code == CmdCode.CUSTOM:
+            if self.custom_cmd_code_int == None:
+                raise ValueError('cmd_code==CUSTOM but custom_cmd_code_int not set')
+        else:
+            if self.custom_cmd_code_int != None:
+                raise ValueError('cmd_code!=CUSTOM but custom_cmd_code_int is set')
 
     def __str__(self):
         s = '{}[{}]'.format(type(self).__name__, self._str_params())
         return s
 
-    def _get_packet_size(self, protocol_version):
+    def get_cmd_code_str_for_user(self):
+        cmd_code_str = repr(self.cmd_code) if self.cmd_code != CmdCode.CUSTOM \
+            else 'CUSTOM({})'.format(self.custom_cmd_code_int)
+        return cmd_code_str
+
+    # Get the integer code that will be sent to target
+    def get_cmd_code_int_to_send(self):
+        return int(self.cmd_code) if self.cmd_code != CmdCode.CUSTOM \
+            else self.custom_cmd_code_int
+
+    def get_packet_size(self, protocol_version):
         assert protocol_version
         if self.__packet_size == None or protocol_version != self._protocol_version:
             self._protocol_version = protocol_version
@@ -107,12 +130,14 @@ class DebuggerRequest(object):
     def _calc_packet_size(self, protocol_version):
         # protocol version must be the same for calculate size and send
         self._protocol_version = protocol_version
-        return NO_PARAMS_REQUEST_SIZE
+        return self.NO_PARAMS_REQUEST_SIZE
 
     # parameters inside the response to __str__()
     def _str_params(self):
+        cmd_code = self.cmd_code if self.cmd_code != CmdCode.CUSTOM \
+            else self.custom_cmd_code_int
         s = 'cmdcode={},size={},reqid={}'.format(
-                repr(self.cmd_code), self.__packet_size, self.request_id)
+                self.get_cmd_code_str_for_user(), self.__packet_size, self.request_id)
         if self.caller_data:
             s += ',cdata={}'.format(self.caller_data)
         return s
@@ -128,28 +153,28 @@ class DebuggerRequest(object):
         assert self.cmd_code
         assert self.request_id
         dclient = debugger_client
-        packet_size = self._get_packet_size(debugger_client.get_protocol_version())
+        packet_size = self.get_packet_size(debugger_client.get_protocol_version())
         if self._debug_level() >= 5:
-            print('debug: drqst: send base fields {}({}), packet_size={},requestID={}'.\
-                format(
-                    self.cmd_code.name,
-                    self.cmd_code.value,
-                    packet_size,
-                    self.request_id))
+            print('debug: drqst: send base fields size={},req_id={},cmd={}'.\
+                format(packet_size, self.request_id, self.get_cmd_code_str_for_user()))
         count = 0
         count += dclient.send_uint(packet_size)
         count += dclient.send_uint(self.request_id)
-        count += dclient.send_uint(self.cmd_code)
+        cmd_code_int = int(self.cmd_code) if self.cmd_code != CmdCode.CUSTOM \
+            else self.custom_cmd_code_int
+        count += dclient.send_uint(cmd_code_int)
 
         # data validation
-        # protocol_version set in _get_packet_size()
-        self.__verify_num_written(NO_PARAMS_REQUEST_SIZE, count)
+        # protocol_version set in get_packet_size()
+        self.__verify_num_written(self.NO_PARAMS_REQUEST_SIZE, count)
         assert self._protocol_version == debugger_client.get_protocol_version()
         return count
 
     # @param validate if true, raise an exception if the counts don't match
     # @return actual value
-    def __verify_num_written(self, expected, actual, validate=True):
+    def __verify_num_written(self, expected, actual, validate=True) -> int:
+        if global_config.get_is_exiting():
+            return actual
         if validate and expected != actual:
             s = 'INTERNAL ERROR: bad size written expected={},actual={}'.format(
                 expected, actual)
@@ -157,6 +182,8 @@ class DebuggerRequest(object):
             raise AssertionError(s)
         return actual
 
+    # Writes debug output and verifies data was written
+    # This should be called after a command is fully sent.
     def _debug_command_sent(self, debugger_client, wr_count, validate=True):
         if (self._debug_level() >= 2):
             print('debug: drqst: command sent: {}'.format(self))
@@ -168,11 +195,12 @@ class DebuggerRequest(object):
         return max(global_config.debug_level, self.__local_debug_level)
 
 
-# Private subclass
-class _DebuggerRequest_NoParams(DebuggerRequest):
-    def __init__(self, cmd_code, caller_data=None):
-        super(_DebuggerRequest_NoParams, self).\
-                __init__(cmd_code, caller_data=caller_data)
+# A base class for commands that take no parameters.
+# @param custom_code_int sent as cmd code if cmd_code==CmdCode.CUSTOM, ignored otherwise
+class DebuggerRequest_NoParamsBase(DebuggerRequest):
+    def __init__(self, cmd_code, custom_cmd_code_int=None, caller_data=None):
+        super(). __init__(cmd_code, custom_cmd_code_int=custom_cmd_code_int,
+            caller_data=caller_data)
         self.__local_debug_level = 0
 
     def _debug_level(self):
@@ -213,12 +241,12 @@ class DebuggerRequest_AddBreakpoints(DebuggerRequest):
         #        uint32:line_num
         #        uint32:ignore_count
         #    ... breakpoint_spec repeated num_breakpoints times
-        packet_size += UINT32_SIZE # num_breakpoints
+        packet_size += self.UINT32_SIZE # num_breakpoints
         try:
             for one_break in self.__adjusted_breakpoints:
                 # encode() does not include trailing 0
                 packet_size += len(one_break.file_uri.encode('utf-8')) + 1
-                packet_size += (2*UINT32_SIZE) # line_num, ignore_count
+                packet_size += (2*self.UINT32_SIZE) # line_num, ignore_count
         except Exception:
             if self._debug_level() >= 5:
                 print('debug: drqst: exception:')
@@ -323,14 +351,14 @@ class DebuggerRequest_AddConditionalBreakpoints(DebuggerRequest):
         #        uint32:ignore_count
         #        utf8z:cond_expr
         #    ... breakpoint_spec repeated num_breakpoints times
-        packet_size += UINT32_SIZE  # flags
-        packet_size += UINT32_SIZE  # num_breakpoints
+        packet_size += self.UINT32_SIZE  # flags
+        packet_size += self.UINT32_SIZE  # num_breakpoints
         try:
             for one_break in self.breakpoints:
                 # encode() does not include trailing 0
                 packet_size += len(one_break.file_uri.encode('utf-8')) + 1
-                packet_size += UINT32_SIZE # line_num
-                packet_size += UINT32_SIZE # ignore_count
+                packet_size += self.UINT32_SIZE # line_num
+                packet_size += self.UINT32_SIZE # ignore_count
                 cond_expr = one_break.cond_expr if one_break.cond_expr else ''
                 packet_size += len(cond_expr.encode('utf-8')) + 1
         except Exception:
@@ -375,19 +403,19 @@ class DebuggerRequest_AddConditionalBreakpoints(DebuggerRequest):
 # END class DebuggerRequest_AddConditionalBreakpoints
 
 
-class DebuggerRequest_Continue(_DebuggerRequest_NoParams):
+class DebuggerRequest_Continue(DebuggerRequest_NoParamsBase):
     def __init__(self, caller_data=None):
         super(DebuggerRequest_Continue, self).\
             __init__(CmdCode.CONTINUE, caller_data=caller_data)
 
 
-class DebuggerRequest_ExitChannel(_DebuggerRequest_NoParams):
+class DebuggerRequest_ExitChannel(DebuggerRequest_NoParamsBase):
     def __init__(self, caller_data=None):
         super(DebuggerRequest_ExitChannel, self).\
                     __init__(CmdCode.EXIT_CHANNEL, caller_data=caller_data)
 
 
-class DebuggerRequest_ListBreakpoints(_DebuggerRequest_NoParams):
+class DebuggerRequest_ListBreakpoints(DebuggerRequest_NoParamsBase):
     def __init__(self, caller_data=None):
         super(DebuggerRequest_ListBreakpoints, self).__init__(
                 CmdCode.LIST_BREAKPOINTS, caller_data=caller_data)
@@ -411,7 +439,7 @@ class DebuggerRequest_RemoveBreakpoints(DebuggerRequest):
         #    uint32:num_breakpoints,
         #        uint32 breakpoint_id
         #        ... breakpoint_id repeated num_breakpoints times
-        packet_size += ((1+len(self.breakpoint_ids)) * UINT32_SIZE)
+        packet_size += ((1+len(self.breakpoint_ids)) * self.UINT32_SIZE)
         return packet_size
 
     # Intended for use only within this package
@@ -446,7 +474,7 @@ class DebuggerRequest_Stacktrace(DebuggerRequest):
     def _calc_packet_size(self, protocol_version):
         packet_size = super(DebuggerRequest_Stacktrace, self).\
             _calc_packet_size(protocol_version)
-        packet_size += UINT32_SIZE
+        packet_size += self.UINT32_SIZE
         return packet_size;
 
     # Intended for use only within this package
@@ -463,44 +491,44 @@ class DebuggerRequest_Stacktrace(DebuggerRequest):
 
 # Step (briefly execute) one thread
 # @param step_type enum StepType
-class DebuggerRequest_Step(_DebuggerRequest_NoParams):
+class DebuggerRequest_Step(DebuggerRequest_NoParamsBase):
 
     def __init__(self, thread_index, step_type, caller_data=None):
         assert isinstance(step_type, StepType)
         super(DebuggerRequest_Step,self).__init__(CmdCode.STEP,
             caller_data=caller_data)
-        self.__thread_index = thread_index
-        self.__step_type = step_type
+        self.thread_index = thread_index
+        self.step_type = step_type
 
     def _calc_packet_size(self, protocol_version):
         packet_size = super(DebuggerRequest_Step, self).\
             _calc_packet_size(protocol_version);
-        packet_size += (UINT32_SIZE + UINT8_SIZE)
+        packet_size += (self.UINT32_SIZE + self.UINT8_SIZE)
         return packet_size
 
     # Intended for use only within this package
     def _send(self, debugger_client):
         wrcnt = self._send_base_fields(debugger_client)
-        wrcnt += debugger_client.send_uint(self.__thread_index)
-        wrcnt += debugger_client.send_byte(self.__step_type.value)
+        wrcnt += debugger_client.send_uint(self.thread_index)
+        wrcnt += debugger_client.send_byte(self.step_type.value)
         self._debug_command_sent(debugger_client, wrcnt)
 
 
     def _str_params(self):
         s = super(DebuggerRequest_Step, self)._str_params()
-        s += ',thidx={}'.format(self.__thread_index)
-        s += ',steptype={}'.format(str(self.__step_type))
+        s += ',thidx={}'.format(self.thread_index)
+        s += ',steptype={}'.format(str(self.step_type))
         return s
 
 
 # Stop all threads
-class DebuggerRequest_Stop(_DebuggerRequest_NoParams):
+class DebuggerRequest_Stop(DebuggerRequest_NoParamsBase):
     def __init__(self, caller_data=None):
         super(DebuggerRequest_Stop,self).__init__(CmdCode.STOP,
                     caller_data=caller_data)
 
 # Enumerate all threads
-class DebuggerRequest_Threads(_DebuggerRequest_NoParams):
+class DebuggerRequest_Threads(DebuggerRequest_NoParamsBase):
     def __init__(self, caller_data=None):
         super(DebuggerRequest_Threads, self).\
                         __init__(CmdCode.THREADS, caller_data=caller_data)
@@ -510,7 +538,8 @@ class DebuggerRequest_Threads(_DebuggerRequest_NoParams):
 # VARIABLES
 ########################################################################
 
-# Get variables accessible from a given stack frame
+# Requues to get variables accessible from a given stack frame
+# @attr variable_path list of strings that reference a variable
 class DebuggerRequest_Variables(DebuggerRequest):
 
     # Get the value of a variable, referenced from the specified
@@ -552,12 +581,12 @@ class DebuggerRequest_Variables(DebuggerRequest):
         #    uint32:frame_index
         #    uint32:variable_path_len,
         #    char*[]:variable_path
-        packet_size += (UINT8_SIZE + (3 * UINT32_SIZE))
+        packet_size += (self.UINT8_SIZE + (3 * self.UINT32_SIZE))
         for elem in self.variable_path:
             # encode() does not include trailing 0
             packet_size += len(elem.encode('utf-8')) + 1
         if protocol_version.has_feature(ProtocolFeature.CASE_SENSITIVITY):
-            packet_size += UINT8_SIZE * len(self.path_force_case_insensitive)
+            packet_size += self.UINT8_SIZE * len(self.path_force_case_insensitive)
         return packet_size
 
     # parameters inside the result of __str__()
@@ -624,7 +653,7 @@ class DebuggerRequest_Execute(DebuggerRequest):
         #    uint32:thread_index,
         #    uint32:frame_index,
         #    char*:source_code
-        packet_size += (2 * UINT32_SIZE)
+        packet_size += (2 * self.UINT32_SIZE)
         packet_size += len(self.source_code.encode('utf-8')) + 1
         return packet_size
 

@@ -106,6 +106,9 @@ class AppInstallerClient(object):
         self.__installer_base_url = \
              'http://{}:{}/plugin_install'.format(self.__ip_addr, PORT)
 
+    def get_target_ip_addr(self):
+        return self.__ip_addr
+
     def remove(self):
         print('info: Removing dev channel, if installed...')
         (boundary, body_data) = HTTPConnection.buildMultipartFormData([

@@ -34,6 +34,7 @@ import copy, enum, re, sys, queue, threading, time, traceback
 from rokudebug.model import Breakpoint
 from rokudebug.model import BreakpointManager
 from rokudebug.model import CmdCode
+from rokudebug.model import DebuggerClient
 from rokudebug.model import DebuggerRequest
 from rokudebug.model import DebuggerRequest_AddBreakpoints
 from rokudebug.model import DebuggerRequest_AddConditionalBreakpoints
@@ -54,13 +55,16 @@ from rokudebug.model import ProtocolVersion
 from rokudebug.model import SourceCodeInspector
 from rokudebug.model import StepType
 from rokudebug.model import ThreadStopReason
+from rokudebug.model import ProtocolError
 from rokudebug.model import UpdateType
 from rokudebug.model import VariableType
 from rokudebug.model import Verbosity
 from rokudebug.model import get_stop_reason_str_for_user
+from rokudebug.model.testmgr import TestState
 
 from .CommandLineCompleter import CommandLineCompleter
 from .CommandLineCompleter import CompletionDomain
+from .NullDebuggerClient import NullDebuggerClient
 from .UserInputProcessor import UserInputProcessor
 
 global_config = getattr(sys.modules['__main__'], 'global_config', None)
@@ -87,6 +91,8 @@ _THREAD_LINE_FMT = '{:2d}{:1s} {:<40s} {}'
 
 _LITERAL_PRIMARY_THREAD_INDEX = 'primary_thread_index'
 _LITERAL_THREAD_INDEX = 'thread_index'
+
+_NO_CONN_PROTOCOL_VERSION = ProtocolVersion(3,2,0)  # Used if not connected to a target
 
 # We add a dict to caller_data for requests, that only this module
 # accesses. These are the keys in that dict.
@@ -142,6 +148,8 @@ class _CmdSpec(object):
     # supplied by the user, prior to calling func. func() may be called
     # with or without an args_str parameter.
     #
+    # requires_connection: Debugger must be connected to target debuggee
+    #
     # is_active: An active command can be invoked by the user and appears
     # in short help (if is_visible). An inactive command will still appear
     # in short help if is_visible, but will never be invoked based on
@@ -161,6 +169,7 @@ class _CmdSpec(object):
                     args_are_optional=False,
                     short_desc=None,
                     long_help=None,
+                    requires_connection=False,
                     is_active=True,
                     show_args_in_short_help=False):
 
@@ -194,6 +203,8 @@ class _CmdSpec(object):
         if long_help:
             if not isinstance(long_help, str):
                 raise TypeError('long_help')
+        if not isinstance(requires_connection, bool):
+            raise TypeError('requires_connection')
         if not isinstance(is_active, bool):
             raise TypeError('is_active')
         if not isinstance(show_args_in_short_help, bool):
@@ -214,6 +225,7 @@ class _CmdSpec(object):
         self.short_desc = short_desc
         self.long_help = long_help
         self.is_separator = False
+        self.requires_connection = requires_connection
         self.is_active = is_active
         self.show_args_in_short_help = show_args_in_short_help
 
@@ -278,18 +290,27 @@ class _CmdSpecSeparator(_CmdSpec):
 # All output from the target is sent to the target_output_controller
 # @param target_output_controller must have two file-like attrs:
 #                               targetout, targeterr
+# @param channel_zip_file_path string path to zip file
+# @param lib_sources list of LibrarySourceSpecifier or None
 # param debug_preserve_breakpoint_path if True, don't modify the breakpoint
 #       path, to test the target's ability to handle arbitrary values
 class CommandLineInterface(object):
-    def __init__(self, channel_zip_file_path,
-                    target_output_controller, stop_target_on_launch,
-                    debug_preserve_breakpoint_path):
+    def __init__(self, channel_zip_file_path, lib_sources,
+            target_output_controller, stop_target_on_launch,
+            test_mgr, debug_preserve_breakpoint_path):
         self._debug_level = 0
 
+        self.__test_mgr = test_mgr
+        self.__tests_are_autorun = False
+        self.__final_test_exit_code = None
+        self.__waiting_for_initial_stopped_message = False
+        self.__channel_exit_timer = None
+        self.__shutdown_waiting_on_exit_channel = False
         self.__stop_target_on_launch = stop_target_on_launch
         self.__debugger_client = None   # set in interact()
         self.__channel_zip_file_path = channel_zip_file_path
-        self.__protocol_version = None  # set in interact()
+        self.__lib_sources = lib_sources
+        self.__protocol_version = _NO_CONN_PROTOCOL_VERSION
         self.__in_file = sys.stdin
         self.__out_file = sys.stdout
         self.__target_output_controller = target_output_controller
@@ -297,11 +318,11 @@ class CommandLineInterface(object):
 
         # guard primarily for asynchronous shutdown requests
         self.__self_state_lock = threading.Lock()
+        self.__is_handling_update = False
         self.__is_interacting = False
         self.__is_shut_down = False
 
         self.__cmd_mode = _CommandMode.COMMANDS
-        self.__is_connected = False
         self.__target_state = _TargetState.UNKNOWN # use accessor methods
         self.__target_state_lock = threading.Lock()
         self.__threads = None          # DebuggerReponse_Threads.ThreadInfo
@@ -315,7 +336,8 @@ class CommandLineInterface(object):
         self.__breakpoints = BreakpointManager()
 
         # protected
-        self._src_inspector = SourceCodeInspector(self.__channel_zip_file_path)
+        self._src_inspector = SourceCodeInspector(
+            self.__channel_zip_file_path, self.__lib_sources)
 
         # private
         self.__input_cond_var = threading.Condition()  # notified on user or debugger event
@@ -333,14 +355,24 @@ class CommandLineInterface(object):
         self.__hint_tabs_complete = _Hint(
             'tab-completion of commands and files works on most platforms')
 
+        # Register our listeners, see if test has already been selected
+        self.__test_mgr.add_listener(self)
+        self.__test_or_debugger_client_changed()
+
         if self.__check_debug(2):
             if self.__debug_preserve_breakpoint_path:
                 print('debug: will pass breakpoint paths to target without modification')
 
-    def interact(self, debugger_client):
+    # Start the command line, with or without a channel already running
+    # @param debugger_client may be None if no channel has been installed
+    def interact(self, app_installer, debugger_client):
         if self.__check_debug(2):
-            print('debug:cli: interact() -- start')
+            print('debug: cli: interact() -- start')
+        self.__app_installer = app_installer
+        if not debugger_client:
+            debugger_client = NullDebuggerClient(_NO_CONN_PROTOCOL_VERSION)
         self.__debugger_client = debugger_client
+        self.__test_or_debugger_client_changed()
         self.__protocol_version = debugger_client.protocol_version
 
         fin = self.__in_file
@@ -353,16 +385,29 @@ class CommandLineInterface(object):
 
         with self.__self_state_lock:
             self.__is_interacting = True
-        self.__set_target_state(_TargetState.RUNNING)
-        self.__is_connected = True
-        self.__waiting_for_initial_stopped_message = \
+        if self.__debugger_client.is_connected():
+            self.__set_target_state(_TargetState.RUNNING)
+            self.__waiting_for_initial_stopped_message = \
                 self.__debugger_client.has_feature(
                     ProtocolFeature.STOP_ON_LAUNCH_ALWAYS)
+        else:
+            self.__set_target_state(_TargetState.TERMINATED)
 
         self.__print_intro()
         self.__input_processor = UserInputProcessor(
             [_COMMAND_PROMPT], self, CommandLineCompleter(self), fin, fout)
         self.__input_processor.start()
+
+        # A 'stop-channel-on-launch' test starts immediately, so that it
+        # will receive all channel startup events
+        if self.__test_mgr.get_current_test():
+            # A test has already been selected by our caller, so run it and exit
+            self.__tests_are_autorun = True
+            if self.__test_mgr.get_current_test().stop_channel_on_launch:
+                # start test now, so it will see initial stop that happens on launch
+                self.__test_mgr.start_current_test(self.__debugger_client)
+        else:
+            self.__tests_are_autorun = False
 
         done = False
         try:
@@ -373,93 +418,98 @@ class CommandLineInterface(object):
                     break
 
                 ############################################################
-                # Wait for pending requests to complete
-                # Items are removed from the pending queue when matching
-                # responses are received, so wait for all of those responses.
+                # Wait for message from target or user input
                 # REMIND: we should have a timeout on this, in case the device
                 #         is disconnected (or crashes)
                 ###########################################################
                 with self.__input_cond_var:
                     dclient = self.__debugger_client
-                    while (not done) and dclient.has_pending_request():
-                        if self.__shutdown_trigger:
-                            done = True
-                            break
-                        if self.__check_debug(5):
-                            print('debug: cli: wait for {} pending requests...' \
-                                .format(self.__debugger_client.\
-                                    get_pending_request_count()))
+                    if self.__shutdown_trigger:
+                        done = True
+                        break
 
-                        # On some platforms (e.g., Windows 10), a signal (e.g., ^C) will
-                        # not interrupt a wait(), so we poll here to allow signal handling
-                        self.__input_cond_var.wait(1.0)
-                if self.__check_debug(5):
-                    print('debug: pending requests: {}'.format(
-                        self.__debugger_client.get_pending_request_count()))
+                    # On some platforms (e.g., Windows 10), a signal (e.g., ^C) will
+                    # not interrupt a wait(), so we limit wait time and poll here to
+                    # allow signal handling.
+                    # Additionally, if a test is running then debug target output needs to
+                    # be sent to that test occasionally. Currently, output from the target
+                    # does not cause a notification.
+                    self.__input_cond_var.wait(1.0)
 
-                ##########################################################
-                # Wait for user input or debugger updates
-                ##########################################################
-                with self.__input_cond_var:
-                    while (not done) and \
-                        self.__user_input_queue.empty() and \
-                                self.__debugger_update_queue.empty():
-                        if self.__shutdown_trigger:
-                            done = True
-                            break
-                        input_count = self.__input_processor.get_input_count()
+                ########################################################
+                # Update any test in progress
+                ########################################################
 
-                        # Set prompt
-                        prompts = list()
-                        if self.__cmd_mode == _CommandMode.COMMANDS:
-                            if self.__prev_cmd_failed or (input_count < 1):
-                                self.__prev_cmd_failed = False
-                                s = self.__hint_use_help.get_text()
-                                if s:
-                                    prompts.append(s)
-                                s = self.__hint_tabs_complete.get_text()
-                                if s:
-                                    prompts.append(s)
-                            if input_count >= 1:
-                                self.__hint_use_help.suppress()
-                                self.__hint_tabs_complete.suppress()
-                            prompts.append(self.__get_status_line())
-                            prompts.append(_COMMAND_PROMPT)
-                        elif self.__cmd_mode == _CommandMode.BRIGHTSCRIPT:
-                            prompts.append(_BS_PROMPT)
+                cur_test = self.__update_test_state()
+                if cur_test:
+                    while self.__test_mgr.test_is_running(cur_test):
+                        test_cmd_line = cur_test.get_next_cmd_line()
+                        if test_cmd_line:
+                            self.__input_processor.simulate_input(test_cmd_line)
                         else:
-                            if self.__check_debug(1):
-                                raise AssertionError('bad command mode: {}'.
-                                    format(self.__cmd_mode))
-                        self.__input_processor.set_prompt_lines(prompts)
-                        self.__input_processor.accept_input(True)
-
-                        # On some platforms (e.g., Windows 10), a signal (e.g., ^C) will
-                        # not interrupt a wait(), so we poll here to allow signal handling
-                        self.__input_cond_var.wait(1.0)
+                            break
+                del cur_test
 
                 #########################################################
-                # Process pending updates and user input
-                # We know something is pending
+                # Process pending updates from target
                 #########################################################
 
                 # queue.Queue is thread-safe. Nothing else is removing elements
                 # from the queues, so no additional synchronization is necessary.
 
                 # Process debugger updates first
-                while (not done) and (not self.__debugger_update_queue.empty()):
+                while not done and not self.__debugger_update_queue.empty():
+                    with self.__self_state_lock:
+                        self.__is_handling_update = True
                     self.__process_debugger_update(self.__debugger_update_queue.get())
+                    with self.__self_state_lock:
+                        self.__is_handling_update = False
+
+                ########################################################
+                # Process queued user input
+                ########################################################
 
                 # Process user input
-                while (not done) and (not self.__user_input_queue.empty()):
+                while not done and not self.__user_input_queue.empty():
                     if self.__shutdown_trigger:
                         done = True
                         break
                     self.__handle_cmd_line(self.__user_input_queue.get())
-            # end: while not done
+
+                ##########################################################
+                # Accept user input
+                ##########################################################
+
+                if self.__prompt_for_user_input():
+                    input_count = self.__input_processor.get_input_count()
+                    prompts = list()
+                    if self.__cmd_mode == _CommandMode.COMMANDS:
+                        if self.__prev_cmd_failed or (input_count < 1):
+                            self.__prev_cmd_failed = False
+                            s = self.__hint_use_help.get_text()
+                            if s:
+                                prompts.append(s)
+                            s = self.__hint_tabs_complete.get_text()
+                            if s:
+                                prompts.append(s)
+                        if input_count >= 1:
+                            self.__hint_use_help.suppress()
+                            self.__hint_tabs_complete.suppress()
+                        prompts.append(self.__get_status_line())
+                        prompts.append(_COMMAND_PROMPT)
+                    elif self.__cmd_mode == _CommandMode.BRIGHTSCRIPT:
+                        prompts.append(_BS_PROMPT)
+                    else:
+                        if self.__check_debug(1):
+                            raise AssertionError('bad command mode: {}'.
+                                format(self.__cmd_mode))
+                    self.__input_processor.set_prompt_lines(prompts)
+                    self.__input_processor.accept_input()
+
+            # END: while not done
         except Exception:
             if self.__check_debug(2):
-                print('debug:cli: exception:')
+                print('debug: cli: exception:')
                 traceback.print_exc(file=sys.stdout)
             raise
 
@@ -469,17 +519,13 @@ class CommandLineInterface(object):
         ############################################################
         # Shut down
         ############################################################
-        if self.__check_debug(1):
-            print('debug: cli.interact() exited loop, shutting down...')
+        if self.__check_debug(2):
+            print('debug: cli: interact() exited loop, shutting down...')
 
         # Ignore exceptions during shutdown, because there is nothing
         # we can do about it.
         try:
-            # This process is unlikely to be alive when the target responds
-            # to the exit request. But, if it is alive, make sure the request
-            # is in the pending queue to avoid crashes and assertion.
-            cmd = DebuggerRequest_ExitChannel()
-            self.__debugger_client.send(cmd)
+            self.__send_final_channel_terminate_if_needed()
         except Exception:
             if self.__check_debug(2):
                 print('debug: exception:')
@@ -494,8 +540,67 @@ class CommandLineInterface(object):
         with self.__self_state_lock:
             self.__is_shut_down = True
         if self.__check_debug(2):
-            print('debug: cli.interact(): done')
-    # end: while not done
+            print('debug: cli: interact(): done')
+    # END: interact()
+
+    def __prompt_for_user_input(self):
+        with self.__self_state_lock:
+            if self.__waiting_for_initial_stopped_message:
+                return False
+            if self.__is_handling_update:
+                return False
+        if self.__debugger_client and self.__debugger_client.has_pending_request():
+            return False
+        if not self.__debugger_update_queue.empty():
+            return False
+        if self.__test_mgr.current_test_is_running():
+            return False
+        return True
+
+    # @return current test or None
+    def __update_test_state(self) -> object:
+        test_mgr = self.__test_mgr
+        test = test_mgr.get_current_test()
+        if not test:
+            return None
+
+        if self.__check_debug(10):
+            print('debug: cli: __update_test_state(), name={},test={}'.format(
+                test.name if test else None, test))
+
+        test_mgr.mark_current_test_if_timed_out()
+        test_mgr._send_current_test_target_output(self.__debugger_client)
+        state = test_mgr.get_current_test_state()
+        if test_mgr.current_test_is_done():
+            if state != test_mgr.get_current_test_last_user_reported_state():
+                print('{}'.format(test_mgr.get_current_test_status_summary()))
+            test_mgr.set_current_test_last_user_reported_state(state)
+            if self.__tests_are_autorun:
+                if global_config.verbosity >= Verbosity.NORMAL:
+                    print('info: specified tests completed. Exiting')
+                self.__final_test_exit_code = \
+                    0 if test_mgr.get_current_test_state() \
+                                            == TestState.DONE_SUCCESS else 1
+                if not self.__send_final_channel_terminate_if_needed():
+                    # We don't need to wait for channel termination
+                    do_exit(self.__final_test_exit_code)
+        return test_mgr.get_current_test()
+
+    # Callback from TestManager
+    def test_changed(self, info):
+        self.__test_or_debugger_client_changed()
+
+    def __test_or_debugger_client_changed(self):
+        test = self.__test_mgr.get_current_test()
+        dclient = self.__debugger_client
+        if self.__check_debug(2):
+            print('debug: cli: test or debugger client changed, test={},dclient={}'
+                  .format(test, dclient))
+        if dclient:
+            if test and test.causes_connection_errors:
+                dclient.set_suppress_connection_errors(True)
+            else:
+                dclient.set_suppress_connection_errors(False)
 
     # Can be invoked by any thread to stop the debug target, which will
     # begin a debugging session.
@@ -506,29 +611,42 @@ class CommandLineInterface(object):
     # Begins the shutdown sequence, and returns immediately
     # The shutdown sequence sends termination requests to the target,
     # closes I/O channels, stops processing commands, and returns from
-    # interact().
+    # interact(). Shutdown is complete when interact() returns.
     # May be called from any thread
-    def shutdown(self):
+    def shutdown_async(self):
         with self.__input_cond_var:
             # lock ordering : 1)input_cond_var's lock, 2)__self_state_lock
             with self.__self_state_lock:
                 if not self.__is_interacting:
                     return
             if (self.__check_debug(2)):
-                print('debug: cli.shutdown(): triggering shutdown')
+                print('debug: cli: shutdown(): triggering shutdown')
             self.__shutdown_trigger = True
             self.__input_cond_var.notify_all()
 
-        # REMIND: This sleep is to make sure an ExitChannel request
-        # has been sent to the target. This should be improved, so
-        # the sleep can be removed.
-        if not self.__debugger_client.is_fake:
-            time.sleep(3)
+    def __has_tests(self):
+        return self.__test_mgr and self.__test_mgr.count_tests()
 
-        # # Now block until final exit command has been sent to target
-        # while not self.__is_shut_down:
-        #     print('debug: cli.shutdown(): waiting for shutdown...')
-        #     time.sleep(1)
+    # If a channel is connected, send an EXIT_CHANNEL command in
+    # preparation for shutting down this script.
+    # @return True if an EXIT_CHANNEL request has been sent, False otherwise
+    def __send_final_channel_terminate_if_needed(self) -> bool:
+        if self.__shutdown_waiting_on_exit_channel:
+            return True
+        wasSent = False
+        dclient = self.__debugger_client
+        if dclient and dclient.is_connected():
+            self.__shutdown_waiting_on_exit_channel = True
+            dclient.set_suppress_connection_errors(True)
+            cmd = DebuggerRequest_ExitChannel()
+            dclient.send(cmd)
+            if self.__check_debug(2):
+                print('debug: cli: sent final exit_channel request')
+            self.__channel_exit_timer = threading.Timer(1.0,
+                    self.__channel_exited_or_timeout, [False])
+            self.__channel_exit_timer.start()
+            wasSent = True
+        return wasSent
 
     # Blocks while waiting for input
     # @return (potentially empty) string, never None
@@ -566,13 +684,13 @@ class CommandLineInterface(object):
 
     def __build_cmd_spec_list(self):
         if self.__check_debug(2):
-            print('debug: get_cmd_spec_list(),protocolver={}'.format(
+            print('debug: build_cmd_spec_list(),protocolver={}'.format(
                 self.__protocol_version))
 
         ###############################################
         # Determine which commands to include
         ###############################################
-        proto_ver = self.__debugger_client.protocol_version
+        proto_ver = self.__protocol_version
 
         has_execute_command = proto_ver.has_feature(
                                 ProtocolFeature.EXECUTE_COMMAND)
@@ -596,6 +714,15 @@ class CommandLineInterface(object):
 
         # _CmdSpec(cmd_str, is_visible, sort_order, func,
         #           short_aliases=None, example_args=None, short_desc=None):
+
+        if self.__has_tests():
+            # test command is invisible, because it is handled separately in help output
+            cmds.append(_CmdSpec('test', False, 999, self.__handle_cmd_test,
+                example_args='<test-name>',
+                args_are_optional=False,
+                short_desc='Run test by name',
+                long_help='Run a test by name. While the test is running, no\n'\
+                    'command line input will be accepted.'))
 
         cmds.extend([
 
@@ -624,7 +751,8 @@ class CommandLineInterface(object):
             _CmdSpec('continue', True, 210, self.__handle_cmd_continue,
                     short_desc='Continue all threads'),
             _CmdSpec('stop', True, 220, self.__handle_cmd_stop,
-                    short_desc='Stop all threads'),
+                    short_desc='Stop all threads',
+                    requires_connection=True),
 
             # Inspection commands
 
@@ -669,6 +797,9 @@ class CommandLineInterface(object):
                 _CmdSpec('step', True, 250, self.__handle_cmd_step,
                         short_aliases=['s','t'],
                         short_desc='Step one program statement'),
+                _CmdSpec('killio', True, 260, self.__handle_cmd_disconnect_io,
+                        short_aliases=[],
+                        short_desc='Disconnect io console'),
             ])
 
         if has_breakpoint_commands:
@@ -910,16 +1041,20 @@ class CommandLineInterface(object):
                 disabled_str = ''
                 if not breakpoint.is_enabled():
                     disabled_str = ' (disabled)'
+                verified_str = ''
+                if not breakpoint.is_verified:
+                    verified_str = ' (PENDING)'
                 debug_str = ''
                 if self.__check_debug(2):
                     debug_str = ' [debug: {}]'.format(breakpoint)
-                print('    {:2d}: {}:{}{}{}{}{}'.format(
+                print('    {:2d}: {}:{}{}{}{}{}{}'.format(
                     breakpoint.local_id,
                     breakpoint.file_uri,
                     breakpoint.line_num,
                     cond_expr_str,
                     ignore_count_str,
                     disabled_str,
+                    verified_str,
                     debug_str))
         return True
 
@@ -976,23 +1111,20 @@ class CommandLineInterface(object):
     def __print_thread(self, thread_info, thread_index):
         fout = self.__out_file
         thread = thread_info
-        local_src_line_info = self._src_inspector.get_source_line(
-                                    thread.file_name, thread.line_num)
-        # local_src_line = ''
-        remote_src_line = ''
-        src_line = ''
-        if local_src_line_info and local_src_line_info.text:
-            local_src_line = local_src_line_info.text.strip()
-        if thread.code_snippet:
-            remote_src_line = thread.code_snippet.strip()
-        src_line = remote_src_line
+        src_line = None
 
-        # REMIND: Enable this test when "missing code snippet" bug is fixed in Roku OS
-        # if self.__check_debug(1):   # 1 = validate
-        #     if local_src_line:
-        #         # verify that the target is returning the correct line
-        #         assert local_src_line == remote_src_line, \
-        #                     f'local="{local_src_line}",remote="{remote_src_line}"'
+        # Use local source if we have it because the snippet in the
+        # debugger response may be truncated or protected.
+        src_line_info = self._src_inspector.get_source_line(
+                                thread.file_name, thread.line_num)
+        if src_line_info:
+            src_line = src_line_info.text
+        if not src_line:
+            src_line = thread.code_snippet
+        if src_line:
+            src_line = src_line.strip()
+        if not src_line:
+            src_line = '??'
 
         file_info = '{}({})'.format(thread.file_name, thread.line_num)
         primary = ' '
@@ -1084,9 +1216,10 @@ class CommandLineInterface(object):
 
     # Gets one-line status to present to user
     def __get_status_line(self):
+        dclient = self.__debugger_client
         return 'Channel is {}, {}'.format(
-                    self.__get_target_state().name.lower(),
-                    ["disconnected","connected"][int(self.__is_connected)])
+                self.__get_target_state().name.lower(),
+                "connected" if dclient.is_connected() else "disconnected")
 
 
     ####################################################################
@@ -1098,6 +1231,9 @@ class CommandLineInterface(object):
     # Prints a message to the user, if the debug target is not stopped
     # @return True if stopped, False otherwise
     def __check_stopped(self):
+        if not self.__debugger_client.is_connected():
+            print('ERROR: Not connected to target')
+            return False
         if self.__get_target_state() != _TargetState.STOPPED:
             print('ERROR: Target not stopped (use "stop")')
             return False
@@ -1107,7 +1243,7 @@ class CommandLineInterface(object):
     # @return void
     def __handle_cmd_line(self, cmd_line):
         if self.__check_debug(9):
-            print('debug: cli.__handle_cmd_line({}),mode={}'.format(cmd_line, self.__cmd_mode))
+            print('debug: cli: __handle_cmd_line({}),mode={}'.format(cmd_line, self.__cmd_mode))
         if self.__cmd_mode == _CommandMode.BRIGHTSCRIPT:
             self.__handle_cmd_line_mode_bs(cmd_line)
         elif self.__cmd_mode == _CommandMode.COMMANDS:
@@ -1117,7 +1253,7 @@ class CommandLineInterface(object):
 
     def __handle_cmd_line_mode_bs(self, cmd_line):
         if self.__check_debug(2):
-            print('debug: cli.__handle_cmd_line_mode_bs({})'.format(cmd_line))
+            print('debug: cli: __handle_cmd_line_mode_bs({})'.format(cmd_line))
         cmd_line_stripped = ''
         if cmd_line:
             cmd_line_stripped = cmd_line.strip()
@@ -1129,13 +1265,16 @@ class CommandLineInterface(object):
 
     def __handle_cmd_line_mode_cmd(self, cmd_line):
         if self.__check_debug(9):
-            print('debug: cli.__handle_cmd_line_mode_cmd({})'.format(cmd_line))
+            print('debug: cli: __handle_cmd_line_mode_cmd({})'.format(cmd_line))
         cmd_spec, cmd_args_str = self.__get_cmd_and_args(cmd_line)
         if not cmd_spec:
             self.__prev_cmd_failed = True
             print('ERROR: unknown command: {}'.format(cmd_line))
             self.__hint_bs_to_run_bs.print()
         else:
+            if cmd_spec.requires_connection and not self.__debugger_client.is_connected():
+                print('ERROR: Not connected to target')
+                return
             if not cmd_spec.args_are_optional:
                 if cmd_spec.has_args:
                     if not cmd_args_str:
@@ -1218,7 +1357,7 @@ class CommandLineInterface(object):
                 found = found_cmds[0]
         finally:
             if self.__check_debug(5):
-                print('debug: cli.__match_command({}) -> {}'.format(
+                print('debug: cli: __match_command({}) -> {}'.format(
                     cmd_prefix, found))
         return found
 
@@ -1239,7 +1378,7 @@ class CommandLineInterface(object):
     # @return true on success, false otherwise
     def __handle_cmd_backtrace(self, cmd_spec, args_str):
         if self.__check_debug(2):
-            print('debug: cli.__handle_cmd_backtrace()')
+            print('debug: cli: __handle_cmd_backtrace()')
         if not self.__check_stopped():
             return True
         if not (self.__threads and len(self.__threads)):
@@ -1257,7 +1396,7 @@ class CommandLineInterface(object):
     # @return true on success, false otherwise
     def __handle_cmd_continue(self, cmd_spec, args_str):
         if self.__check_debug(2):
-            print('debug: cli.__handle_cmd_continue()')
+            print('debug: cli: __handle_cmd_continue()')
         if not self.__check_stopped():
             return True
         cmd = DebuggerRequest_Continue()
@@ -1351,6 +1490,10 @@ class CommandLineInterface(object):
                 help_width = max(help_width, len(cmd_entry.short_desc))
         # total_width = min(80, cmd_width + help_width + 2) # approximate
 
+        indent_str = ''
+        for _ in range(int((cmd_width)/2)):
+            indent_str += ' '
+
         # Print the help
         fmtStr = '{:' + str(cmd_width) + 's}  {}'
         for cmd_entry in self.__all_cmds:
@@ -1358,16 +1501,24 @@ class CommandLineInterface(object):
                 continue
             if cmd_entry.is_separator:
                 sep = '----- {} -----'.format(cmd_entry.cmd_str)
-                indent_str = ''
-                for _ in range(int((cmd_width)/2)):
-                    indent_str += ' '
-                print('{}{}'.format(indent_str, sep))
+                print('{}{}'.format(indent_str, sep), file=fout)
             else:
                 print(fmtStr.format(
                         cmd_entry.get_display_str(
                                         cmd_entry.show_args_in_short_help),
                         cmd_entry.short_desc),
                         file=fout)
+
+        # Print tests, if loaded
+        if self.__has_tests():
+            print('{}{}'.format(indent_str, '---- Tests ----'))
+            test_count = 0
+            for test in self.__test_mgr.get_tests_sorted():
+                test_count += 1
+                print('test {} {}'.format(test.name, test.description))
+            if not test_count:
+                print('No tests found')
+
         print(file=fout)
         print('Commands may be abbreviated; e.g., q = quit)', file=fout)
         fout.flush()
@@ -1433,13 +1584,15 @@ class CommandLineInterface(object):
     def __handle_cmd_show(self, cmd_spec, args_str):
         return self.__handle_cmd_show_impl(cmd_spec, args_str)
 
+    def __handle_cmd_disconnect_io(self, cmd_spec, args_str):
+        self.__debugger_client.disconnect_io()
+        return True
+
     # @return true if session should continue, false if we need to quit
     def __handle_cmd_quit(self, cmd_spec, argStr):
-        if self.__debugger_client.is_fake:
-            print('debug: NOT sending ExitChannel because --debug-no-sideload')
+        if not self.__send_final_channel_terminate_if_needed():
             global_config.do_exit(0)
-        cmd = DebuggerRequest_ExitChannel()
-        self.__debugger_client.send(cmd)
+            return False
         return True
 
     # @return true if session should continue, false otherwise
@@ -1481,6 +1634,44 @@ class CommandLineInterface(object):
         print('Suspending threads...', file=fout)
         cmd = DebuggerRequest_Stop()
         self.__debugger_client.send(cmd)
+        return True
+
+    def __handle_cmd_test(self, cmd_spec, args_str) -> None:
+        if self.__check_debug(2):
+            print('debug: handle_cmd_test({})'.format(args_str))
+        if self.__check_debug(1):   # 1 = validation
+            assert self.__test_mgr
+        test_mgr = self.__test_mgr
+
+        # Find the test
+        test_name = args_str.strip()
+        test = test_mgr.set_current_test(test_name)
+        if not test:
+            print('ERROR: test not found: {}'.format(test_name))
+            return True
+
+        # Start the test channel, if not started
+        if not self.__launch_channel(test_mgr.get_test_channel_package_path(test)):
+            return None
+
+        if test_mgr.start_current_test(self.__debugger_client):
+            if global_config.verbosity >= Verbosity.NORMAL:
+                print('info: test started: {}'.format(test_name))
+        else:
+            print('ERROR: test failed to start: {}'.format(test.name))
+        return True
+
+    # @return True on success, false otherwise
+    def __launch_channel(self, channel_package_path) -> bool:
+        self.__app_installer.remove()
+        self.__app_installer.install(channel_package_path, remote_debug=True)
+        self.__debugger_client = \
+                DebuggerClient(self.__app_installer.get_target_ip_addr(),
+                    self.update_received, sys.stdout)
+        self.__test_or_debugger_client_changed()
+        self.__debugger_client.connect()
+        self.__channel_zip_file_path = channel_package_path
+        self._src_inspector = SourceCodeInspector(channel_package_path)
         return True
 
     # Select one thread for inspection
@@ -1637,7 +1828,7 @@ class CommandLineInterface(object):
         breakpoint_tokens_rhs = None
 
         if len(breakpoint_tokens_lhs) < 2:
-            print('ERR: Invalid breakpoint specification: {}'.format(args_str))
+            print('ERROR: Invalid breakpoint specification: {}'.format(args_str))
             return True
 
         breakpoint_tokens_rhs = re.split('\\s+', breakpoint_tokens_lhs[-1],
@@ -1672,12 +1863,12 @@ class CommandLineInterface(object):
 
         # Line number (required)
         if not line_num_str or not len(line_num_str):
-            print('ERR: Missing line number: {}'.format(breakpoint_str))
+            print('ERROR: Missing line number: {}'.format(breakpoint_str))
             return True
         try:
             line_num = int(line_num_str)
         except Exception:
-            print('ERR: Invalid line number ({}): {}'.format(line_num_str, breakpoint_str))
+            print('ERROR: Invalid line number ({}): {}'.format(line_num_str, breakpoint_str))
             return True
 
         # Ignore count (optional)
@@ -1844,11 +2035,18 @@ class CommandLineInterface(object):
     # @return void
     def __process_debugger_update(self, update):
         if self.__check_debug(9):
-            print('debug: cli.__process_debugger_update(), update={}'.format(
+            print('debug: cli: __process_debugger_update(), update={}'.format(
                 update))
-        if not self.__examine_update_and_handle_errors(update):
-            return
-        self.__handle_update(update)
+        handled = False
+
+        # While a test is in progress, the test gets first look at the update
+        if self.__test_mgr.current_test_is_running():
+            handled = self.__test_mgr.get_current_test().handle_update(update)
+
+        if not handled:
+            if not self.__examine_update_and_handle_errors(update):
+                return
+            self.__handle_update(update)
 
     # bool validateUpdate(update)
     # Sanity-checks the update and its associated request, if any. Exits this
@@ -1929,6 +2127,10 @@ class CommandLineInterface(object):
             self.__handle_update_compile_error(update)
         elif update_type == UpdateType.THREAD_ATTACHED:
             self.__handle_update_thread_attached(update)
+        elif update_type == UpdateType.BREAKPOINT_VERIFIED:
+            self.__handle_update_breakpoint_verified(update)
+        elif update_type == UpdateType.PROTOCOL_ERROR:
+            self.__handle_update_protocol_error(update)
 
         # The UpdateType for all responses to specific commands is
         # COMMAND_RESPONSE, so the actual type of the data is determined
@@ -1939,16 +2141,11 @@ class CommandLineInterface(object):
         elif cmd_code == CmdCode.ADD_CONDITIONAL_BREAKPOINTS:
             self.__handle_update_add_breakpoints(update)
         elif cmd_code == CmdCode.CONTINUE:
-            self.__set_target_state(_TargetState.RUNNING)
-            print(file=fout)
+            self.__handle_update_continue_response(update)
         elif cmd_code == CmdCode.EXECUTE:
             self.__handle_update_execute(update)
         elif cmd_code == CmdCode.EXIT_CHANNEL:
-            self.__set_target_state(_TargetState.TERMINATED)
-            self.__is_connected = False
-            print(file=fout)
-            print(self.__get_status_line(),file=fout)
-            do_exit(0)
+            self.__handle_update_exit_channel(update)
         elif cmd_code == CmdCode.LIST_BREAKPOINTS:
             self.__handle_update_list_breakpoints(update)
         elif cmd_code == CmdCode.REMOVE_BREAKPOINTS:
@@ -1967,7 +2164,7 @@ class CommandLineInterface(object):
             self.__handle_update_execute(update)
         else:
             if self.__check_debug(1):
-                msg = 'debug:cli: err: unrecognized update: {}'.format(update)
+                msg = 'debug: cli: err: unrecognized update: {}'.format(update)
                 print(msg)
                 raise AssertionError(msg)
 
@@ -2010,7 +2207,43 @@ class CommandLineInterface(object):
         print('Breakpoint added or updated, now {} breakpoint{}'.format(
                 brk_mgr.count_breakpoints(), s))
 
-    def __handle_update_all_threads_stopped(self, update):
+    def __handle_update_breakpoint_verified(self, update):
+        if self.__check_debug(3):
+            print('debug: cli: __handle_update_breakpoint_verified({})'.format(update))
+
+        for breakpoint_id in update.breakpoint_ids:
+            breakpoint = self.__breakpoints.find_breakpoint_by_remote_id(breakpoint_id)
+            if not breakpoint:
+                print(' INTERNAL ERROR: breakpoint info not found')
+                continue
+            breakpoint.set_verified(True)
+
+    def __handle_update_continue_response(self, update):
+        fout = self.__out_file
+        dclient = self.__debugger_client
+        self.__set_target_state(_TargetState.RUNNING)
+        print(file=fout)
+
+        # If a test has been waiting for the target to start, start it now
+        test = self.__test_mgr.get_current_test()
+        if test and not self.__test_mgr.test_is_done(test) and \
+                        not self.__test_mgr.test_is_running(test):
+            self.__test_mgr.start_current_test(dclient)
+
+    def __handle_update_protocol_error(self, update):
+        if self.__check_debug(3):
+            print('debug: cli: __handle_update_protocol_error({})'.format(update))
+
+        if update.error_code == ProtocolError.IO_PORT_FAIL:
+            print("debug protocol error: IO port fail");
+
+    def __handle_update_all_threads_stopped(self, update) -> None:
+        fout = self.__out_file
+        self.__set_target_state(_TargetState.STOPPED)
+        primary_thridx = update.primary_thread_index
+        if primary_thridx < 0:
+            primary_thridx = 0
+        self.__set_sel_thread(primary_thridx, ok_to_send=False)
 
         if self.__waiting_for_initial_stopped_message:
             # This version of the protocol always sends an
@@ -2019,14 +2252,8 @@ class CommandLineInterface(object):
             if not self.__stop_target_on_launch:
                 # Silently tell target to continue
                 self.__debugger_client.send(DebuggerRequest_Continue(self.__protocol_version))
-                return
+                return None
 
-        fout = self.__out_file
-        self.__set_target_state(_TargetState.STOPPED)
-        primary_thridx = update.primary_thread_index
-        if primary_thridx < 0:
-            primary_thridx = 0
-        self.__set_sel_thread(primary_thridx, ok_to_send=False)
         print('', file=fout)
         print(get_stop_reason_str_for_user(
                 update.stop_reason, update.stop_reason_detail),
@@ -2041,6 +2268,7 @@ class CommandLineInterface(object):
             {CallerKey.STOPPING:{
                 _LITERAL_PRIMARY_THREAD_INDEX:update.primary_thread_index}})
         self.__debugger_client.send(cmd)
+        return None
 
     def __handle_update_breakpoint_error(self, update):
         if self.__check_debug(3):
@@ -2112,6 +2340,39 @@ class CommandLineInterface(object):
                     cmd_spec, _ = self.__get_cmd_and_args(update.request.source_code)
                     if cmd_spec:    # user entered a debuger command while in bs interpreter
                         self.__hint_bs_to_exit_interpreter.print(force=True)
+
+    def __handle_update_exit_channel(self, update):
+        if self.__check_debug(2):
+            print('debug: cli: handle_update_exit_channel({})'\
+                  ',waitingtoexit={}'.format(update,
+                    self.__shutdown_waiting_on_exit_channel))
+        fout = self.__out_file
+        self.__set_target_state(_TargetState.TERMINATED)
+        if self.__shutdown_waiting_on_exit_channel:
+            self.__channel_exited_or_timeout(True)
+        else:
+            print(file=fout)
+            print(self.__get_status_line(),file=fout)
+
+    def __channel_exited_or_timeout(self, received_exit_channel_response):
+        if self.__check_debug(3):
+            print('debug: cli: channel_exited_or_timeout(), received_response={}'.format(
+                received_exit_channel_response))
+        with self.__self_state_lock:
+            if self.__shutdown_waiting_on_exit_channel:
+                if self.__check_debug(2):
+                    if received_exit_channel_response:
+                        print('debug: cli: exit channel response received. Exiting')
+                    else:
+                        print('debug: cli: TIMEOUT - exit channel response NOT received. Exiting')
+                exit_code = 0
+                self.__shutdown_waiting_on_exit_channel = False
+                if self.__channel_exit_timer:
+                    self.__channel_exit_timer.cancel()
+                    self.__channel_exit_timer = None
+                if self.__final_test_exit_code != None:
+                    exit_code = self.__final_test_exit_code
+                do_exit(exit_code)
 
     def __handle_update_list_breakpoints(self, update):
         if self.__check_debug(3):
@@ -2373,7 +2634,7 @@ class CommandLineInterface(object):
     def update_received(self, response):
         request = response.request
         if self.__check_debug(5):
-            print('debug:cli: update_received(response={})'.format(request))
+            print('debug: cli: update_received(response={})'.format(response))
 
         self.__debugger_update_queue.put(response)  # thread-safe
         with self.__input_cond_var:
@@ -2383,13 +2644,13 @@ class CommandLineInterface(object):
         if request and (request.cmd_code == CmdCode.EXIT_CHANNEL):
             return False
         if self.__check_debug(9):
-            print('debug:cli: update_received() done')
+            print('debug: cli: update_received() done')
         return True
 
     # Called on the user input processor thread
     def _user_input_received(self, cmd_line):
         if self.__check_debug(3):
-            print('debug: cli.__user_input_received, cmdline={}'.format(cmd_line))
+            print('debug: cli: __user_input_received, cmdline={}'.format(cmd_line))
         self.__user_input_queue.put(cmd_line)  # thread-safe
         with self.__input_cond_var:
             self.__input_cond_var.notify_all()

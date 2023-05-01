@@ -28,7 +28,7 @@
 # it difficult (but not impossible) for other classes to access
 # those identifiers.
 
-import ctypes, struct, sys, traceback
+import ctypes, socket, struct, sys, traceback
 
 global_config = getattr(sys.modules['__main__'], 'global_config', None)
 assert global_config    # do_exit(), verbosity, global debug_level
@@ -47,6 +47,7 @@ class StreamUtils(object):
     # READ DATA
     ##########################################################################
 
+    # raise EOFError on EOF
     @staticmethod
     def read_uint8(sock, counter):
         return StreamUtils.recv(sock, 1, counter)[0]    # read unsigned 32-bit value, little-endian
@@ -54,6 +55,7 @@ class StreamUtils(object):
     # read little-endian unsigned value of specified length
     # return uint32 value
     @staticmethod
+    # @raise EOFError on EOF
     def read_uint_le(sock, num_bytes, counter):
         buf = StreamUtils.recv(sock, num_bytes, counter)
         uintVal = 0
@@ -61,12 +63,14 @@ class StreamUtils(object):
             uintVal |= (buf[i] << (BITS_PER_BYTE*i))
         return uintVal
 
-    # return uint32 value
+    # @raise EOFError on EOF
+    # @return uint32 value
     @staticmethod
     def read_uint32_le(sock, counter):
         return StreamUtils.read_uint_le(sock, UINT32_NUM_BYTES, counter)
 
     # read signed 64-bit value, little-endian
+    # @raise EOFError on EOF
     @staticmethod
     def read_int64_le(sock, counter):
         # python does not have signed values, so read unsigned
@@ -79,6 +83,7 @@ class StreamUtils(object):
         return ival
 
     # read signed 32-bit value, little-endian
+    # @raise EOFError on EOF
     @staticmethod
     def read_int32_le(sock, counter):
         # python does not have signed values, so read unsigned
@@ -91,13 +96,15 @@ class StreamUtils(object):
         return ival
 
     # read unsigned 64-bit value, little-endian
-    # return uint64 value
+    # @raise EOFError on EOF
+    # @return uint64 value
     @staticmethod
     def read_uint64_le(sock, counter):
         return StreamUtils.read_uint_le(sock, UINT64_NUM_BYTES, counter)
 
     # read 32-bit floating-point IEEE-754 binary32 value, encoded little-endian
     # @return 64-bit floating point
+    # @raise EOFError on EOF
     @staticmethod
     def read_ieee754binary32_le(sock, counter):
         # struct pack/unpack explicitly support IEEE-754 binary32/64 data
@@ -107,6 +114,7 @@ class StreamUtils(object):
         return struct.unpack('<f', buf)[0]
 
     # read 64-bit floating-point IEEE-754 binary64 value, encoded little-endian
+    # @raise EOFError on EOF
     # @return 64-bit floating point
     @staticmethod
     def read_ieee754binary64_le(sock, counter):
@@ -116,6 +124,7 @@ class StreamUtils(object):
         buf = StreamUtils.recv(sock, IEEE754_BINARY64_NUM_BYTES, counter)
         return struct.unpack('<d', buf)[0]
 
+    # @raise EOFError on EOF
     @staticmethod
     def read_utf8(sock, counter):
         buf = bytearray()
@@ -127,28 +136,20 @@ class StreamUtils(object):
         return str(buf, encoding='utf-8')
 
     # Exits this script if EOF is seen
-    # @return byte array
     # private method, intended only for use within this module
+    # @raise EOFError on EOF
+    # @return byte array
     @staticmethod
     def recv(sock, num_bytes, counter):
-        buf_len = 0
-        try:
-            buf = sock.recv(num_bytes)
-            buf_len = len(buf)
-            if counter:
-                counter.byte_read_count += buf_len;
-        except Exception:
-            if global_config.debug_level >= 2:
-                print('debug: exception:')
-                traceback.print_exc(file=sys.stdout)
-
+        buf = sock.recv(num_bytes, socket.MSG_WAITALL)
+        buf_len = len(buf)
+        if counter:
+            counter.byte_read_count += buf_len;
+        if not buf_len:
+            raise EOFError()
         if buf_len != num_bytes:
-            if StreamUtils.__check_debug(2):
-                print('debug: bad read occurred during recv(), expected={},actual={}:'.\
-                    format(num_bytes, buf_len))
-                traceback.print_stack()
-            global_config.do_exit(1,
-                'Unexpected EOF reading debug target stream')
+            raise OSError('bad read, expected num_bytes={},actual={}'.format(
+                num_bytes, buf_len))
         return buf
 
     ##########################################################################

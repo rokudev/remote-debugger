@@ -28,6 +28,7 @@
 # it difficult (but not impossible) for other classes to access
 # those identifiers.
 
+import abc # abstract base class
 import socket, sys, threading, time, traceback
 
 from .DebuggerRequest import CmdCode
@@ -35,7 +36,7 @@ from .DebuggerResponse import ErrCode
 from .DebuggerResponse import UpdateType
 from .DebuggerControlListener import DebuggerControlListener
 from .DebuggerIOListener import DebuggerIOListener
-from .DebugUtils import do_exit, do_print, revision_timestamp_to_str
+from .DebugUtils import do_exit, do_print
 from .ProtocolVersion import ProtocolFeature
 from .ProtocolVersion import ProtocolVersion
 from .StackReferenceIDManager import StackReferenceIDManager
@@ -50,14 +51,54 @@ DEBUGGER_CONNECTION_TIMEOUT_SECONDS = 60
 DEBUGGER_MAGIC = 0x0067756265647362 # 64-bit = [b'bsdebug\0' little-endian]
 DEBUGGER_MAGIC_BYTES_LE = b'bsdebug\0'
 
-class DebuggerClient(object):
+class AbstractDebuggerClient(abc.ABC):
 
-    # Attribute protocol_version is None until successful call is made
+    @abc.abstractmethod
+    def __init__(self, is_fake):
+        self.is_fake = is_fake
+
+    # If suppress==True, connection errors are not reported to the user,
+    # may be changed at any time.
+    # This is useful during shutdown and for tests that test failure modes
+    @abc.abstractmethod
+    def set_suppress_connection_errors(self, suppress) -> None:
+        pass
+
+    @abc.abstractmethod
+    def is_connected(self) -> bool:
+        return False
+
+    @abc.abstractmethod
+    def get_protocol_version(self) -> ProtocolVersion:
+        return None
+
+    # @param feature: enum ProtocolFeature
+    @abc.abstractmethod
+    def has_feature(self, feature) -> bool:
+        return False
+
+    @abc.abstractmethod
+    def get_pending_request_count(self) -> int:
+        return 0
+
+    @abc.abstractmethod
+    def has_pending_request(self) -> bool:
+        return False
+
+    @abc.abstractmethod
+    def shutdown(self) -> None:
+        pass
+
+
+class DebuggerClient(AbstractDebuggerClient):
+
+    # Attribute protocol_version is None until connected
     # to connect_control(), which performs the handshake to the debuggee.
     # Updates from the debuggee are sent to function update_handler(),
     # except CONNECT_IO_PORT update(s) which are handled by this object.
     # @param debuggee_out the file where output from debuggee will be sent
     def __init__(self, target_ip_addr, update_handler, debuggee_out):
+        super().__init__(False)
         assert target_ip_addr
         assert update_handler
         assert debuggee_out
@@ -67,8 +108,12 @@ class DebuggerClient(object):
         self.protocol_version = None    # ProtocolVersion, set during handshake
 
         # Private
+        self.__lock = threading.RLock()
+        self.__suppress_connection_errors = False
+        self.__is_connected = False
+        self.__suppress_connection_errors = False
         self.__stack_ref_id_mgr = StackReferenceIDManager()
-        self.__features = set()         # populated during handshake
+        self.__features = frozenset()   # created during handshake
         self.__io_listener = None
         self.__control_socket = None
         self.__next_request_id = 1 # start with 1 b/c 0 is confused with None
@@ -77,12 +122,24 @@ class DebuggerClient(object):
         self.__caller_update_handler = update_handler
         self.__debuggee_out = debuggee_out
         self.__control_listener = None  # populated during handshake
+        self.__save_target_output = False
 
         # Cached data
-        self.__cached_threads_lock = threading.RLock()
         self.__cached_threads = None           # [thr_idx] -> Latest THREADS response
         self.__cached_thread_stacktraces = None     # [thr_idx] -> Latest STACKTRACE reponse
         self.__cached_thread_stack_variables = None # see __make_cached_variables_key()
+
+    # If suppress==True, connection errors are not reported to the user,
+    # may be changed at any time.
+    # This is useful during shutdown and for tests that test failure modes
+    def set_suppress_connection_errors(self, suppress) -> None:
+        with self.__lock:
+            self.__suppress_connection_errors = suppress
+        if self.__control_listener:
+            self.__control_listener.set_suppress_connection_errors(suppress)
+
+    def is_connected(self):
+        return self.__is_connected
 
     # only valid after connect_control() successfully completes
     # @param feature: enum ProtocolFeature
@@ -90,25 +147,35 @@ class DebuggerClient(object):
         assert self.protocol_version
         return feature in self.__features
 
-    def get_protocol_version(self):
+    # Get a set of all ProtocolFeatures supported
+    # @return frozenset of ProtocolFeature(s)
+    def get_features(self) -> frozenset:
+        return self.__features
+
+    def get_protocol_version(self) -> ProtocolVersion:
         return self.protocol_version
 
-    # @return None if connect_control() has not been called
-    def get_protocol_version_str(self):
-        if self.protocol_version == None:
-            return None
-        s = ''
-        for v in self.protocol_version:
-            if len(s):
-                s = s + '.'
-            s += str(v)
-        return s
+    def set_save_target_output(self, enable) -> bool:
+        self.__save_target_output = enable
+        if self.__io_listener:
+            return self.__io_listener.set_save_output(enable)
+        return True
+
+    def get_target_output_lines(self) -> list:
+        lines = []
+        if self.__io_listener:
+            lines = self.__io_listener.get_output_lines()
+        return lines
 
     def get_next_request_id(self):
         with self.__request_id_lock:
             id = self.__next_request_id
             self.__next_request_id += 1
         return id
+
+    def disconnect_io(self):
+        if self.__io_listener:
+            self.__io_listener.disconnect()
 
     # @return None or int stack reference ID
     def get_stack_ref_id(self, thread_index, frame_index,
@@ -131,14 +198,14 @@ class DebuggerClient(object):
     # be an error. Returns None if an operation has invalidated the
     # cached response.
     def get_threads(self):
-        with self.__cached_threads_lock:
+        with self.__lock:
             return self.__cached_threads
 
     # Get the most recent response to a STACKTRACE request, which
     # may be an error. Returns None if an operation has invalidated the
     # cached response.
     def get_thread_stacktrace(self, thread_index):
-        with self.__cached_threads_lock:
+        with self.__lock:
             frames = None
             if self.__cached_thread_stacktraces and \
                         len(self.__cached_thread_stacktraces) > thread_index:
@@ -157,7 +224,7 @@ class DebuggerClient(object):
         # variable_path can be None
 
         vars_response = None
-        with self.__cached_threads_lock:
+        with self.__lock:
             if self.__cached_thread_stack_variables:
                 vars_key = self.__make_cached_variables_key(thread_index,
                     frame_index, variable_path, get_child_keys,
@@ -167,10 +234,10 @@ class DebuggerClient(object):
                         vars_key, None)
         return vars_response
 
-    # Connect to the debugger's control port
-    # MODIFIES: Sets self.protocol_version (array of 3 ints, each in the range of 0.999)
+    # Connect to the debugger's control port, blocks until connected or failed
+    # MODIFIES: Sets self.protocol_version
     # MODIFIES: Sets self.has_stop_line_number_bug
-    # @see get_protocol_version_int()
+    # @see get_protocol_version()
     def connect(self):
         self.__connect_control()
 
@@ -182,12 +249,12 @@ class DebuggerClient(object):
         # connection being established. To speed things, up, we attempt
         # a connection repeatedly with a short timeout.
         timeout = DEBUGGER_CONNECTION_TIMEOUT_SECONDS
-        connected = False
+        self.__is_connected = False
         try_count = 0
         now = global_config.get_monotonic_time()
         retryEndTime = now + DEBUGGER_CONNECTION_TIMEOUT_SECONDS
         sleepSeconds = 0.1
-        while ((not connected) and (now < retryEndTime)):
+        while ((not self.__is_connected) and (now < retryEndTime)):
             try_count += 1
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(timeout)
@@ -196,7 +263,7 @@ class DebuggerClient(object):
                     try_count, timeout, (retryEndTime-now)))
             try:
                 sock.connect((self.__target_ip_addr, DEBUGGER_PORT))
-                connected = True
+                self.__is_connected = True
             except ConnectionRefusedError:
                 # port not open yet?
                 if self.__check_debug(5):
@@ -210,7 +277,7 @@ class DebuggerClient(object):
             time.sleep(sleepSeconds)
             sleepSeconds = min(1.0, 1.1 * sleepSeconds)
 
-        if not connected:
+        if not self.__is_connected:
             global_config.do_exit(1, 'Could not connect to {}:{}'.format(
                 self.__target_ip_addr, DEBUGGER_PORT))
 
@@ -219,11 +286,11 @@ class DebuggerClient(object):
         self.__control_socket = sock
         self.__do_handshake()
         self.__control_listener = DebuggerControlListener(self,
-            self.__general_update_handler, self.__io_update_handler)
+            self.__general_update_handler, self.__io_update_handler,
+            suppress_connection_errors=self.__suppress_connection_errors)
 
-        print('info: connected to debug target, protocol version={} software_revision={}'.format(
-            self.protocol_version.to_user_str(), 
-            revision_timestamp_to_str(self.protocol_version.get_platform_revision())))
+        print('info: connected to debug target, protocol version={}'.format(
+            self.protocol_version.to_user_str(include_software_revision=True)))
         if self.__check_debug(2):
             strs = []
             for f in self.__features:
@@ -240,8 +307,8 @@ class DebuggerClient(object):
     def __connect_io_port(self, port, out):
         if self.__check_debug(2):
             print('debug:dclient: connect_io_port(port={})'.format(port))
-        self.__io_listener = DebuggerIOListener(
-            self.__target_ip_addr, port, out)
+        self.__io_listener = DebuggerIOListener(self.__target_ip_addr, port, out)
+        self.__io_listener.set_save_output(self.__save_target_output)
 
     def __io_update_handler(self, update):
         assert update.update_type == UpdateType.CONNECT_IO_PORT
@@ -293,7 +360,16 @@ class DebuggerClient(object):
                 request.cmd_code == CmdCode.EXIT_CHANNEL:
             self.__invalidate_thread_cache()
 
-        request._send(self)
+        with self.__lock:
+            suppress = self.__suppress_connection_errors
+        try:
+            request._send(self)
+        except OSError as e:
+            if self.__check_debug(2):
+                print('debug: dclient: exception: suppress={},e={}'.format(
+                    suppress, e))
+            if not suppress:
+                raise
 
     def has_pending_request(self):
         return self.__control_listener.has_pending_request()
@@ -305,27 +381,35 @@ class DebuggerClient(object):
     # RECEIVE DATA
     ####################################################################
 
+    # @raise EOFError on EOF
     def recv_double(self, counter):
         return StreamUtils.read_ieee754binary64_le(self.__control_socket, counter)
 
+    # @raise EOFError on EOF
     def recv_float(self, counter):
         return StreamUtils.read_ieee754binary32_le(self.__control_socket, counter)
 
+    # @raise EOFError on EOF
     def recv_bool(self, counter):
         return self.recv_uint8(counter) != 0
 
+    # @raise EOFError on EOF
     def recv_uint8(self, counter):
         return StreamUtils.read_uint8(self.__control_socket, counter)
 
+    # @raise EOFError on EOF
     def recv_int32(self, counter):
         return StreamUtils.read_int32_le(self.__control_socket, counter)
 
+    # @raise EOFError on EOF
     def recv_uint32(self, counter):
         return StreamUtils.read_uint32_le(self.__control_socket, counter)
 
+    # @raise EOFError on EOF
     def recv_int64(self, counter):
         return StreamUtils.read_int64_le(self.__control_socket, counter)
 
+    # @raise EOFError on EOF
     def recv_str(self, counter):
         s = StreamUtils.read_utf8(self.__control_socket, counter)
         if self.__check_debug(10):
@@ -336,39 +420,58 @@ class DebuggerClient(object):
     # SEND DATA
     ####################################################################
 
+    # @return number of bytes written
     def send_bool(self, bool_val):
-        int_val = 1 if bool_val else 0
-        return StreamUtils.write_uint8(self.__control_socket, int_val)
+        with self.__lock:
+            if self.__control_socket:
+                int_val = 1 if bool_val else 0
+                return StreamUtils.write_uint8(self.__control_socket, int_val)
+        return 0
 
+    # @return number of bytes written
     def send_byte(self, byte_val):
-        return StreamUtils.write_uint8(self.__control_socket, byte_val)
+        with self.__lock:
+            if self.__control_socket:
+                return StreamUtils.write_uint8(self.__control_socket, byte_val)
+        return 0
 
-    def send_uint(self, val):
-        return StreamUtils.write_uint32_le(self.__control_socket, val)
+    # @return number of bytes written
+    def send_uint(self, val) -> int:
+        with self.__lock:
+            if self.__control_socket:
+                return StreamUtils.write_uint32_le(self.__control_socket, val)
+        return 0
 
+    # @return number of bytes written
     def send_str(self, val):
-        return StreamUtils.write_utf8(self.__control_socket, val)
+        with self.__lock:
+            if self.__control_socket:
+                return StreamUtils.write_utf8(self.__control_socket, val)
+        return 0
 
-    # Shuts down the connection to the debugging target.
-    # This should only be called after the response to the
     # final request is received, because unsent data will
     # be discarded (at least on some platforms).
     def shutdown(self):
-        if self.__control_socket:
-            if self.__check_debug(2):
-                print('debug: closing socket')
-            try:
-                self.__control_socket.shutdown(socket.SHUT_RDWR)
-            except Exception:
+        if self.__check_debug(2):
+            print('debug: dclient: shutdown()')
+        with self.__lock:
+            if self.__control_socket:
                 if self.__check_debug(2):
-                    print('debug: exception:')
-                    traceback.print_exc(file=sys.stdout)
-            try:
-                self.__control_socket.close()
-            except Exception:
-                if self.__check_debug(2):
-                    traceback.print_exc(file=sys.stdout)
-            self.__control_socket = None
+                    print('debug: dclient: closing control socket')
+                try:
+                    self.__control_socket.shutdown(socket.SHUT_RDWR)
+                except OSError as e:
+                    if self.__check_debug(2):
+                        print('debug: dclient: controlsock exception, e={}'.format(e))
+                try:
+                    self.__control_socket.close()
+                except OSError as e:
+                    if self.__check_debug(2):
+                        print('debug: dclient: controlsock exception, e={}'.format(e))
+                self.__control_socket = None
+            self.__is_connected = False
+        if self.__check_debug(2):
+            print('debug: dclient: shutdown done')
 
     # Initial handshake with debug server
     # REQUIRES: self.__control_socket is a connected socket
@@ -393,7 +496,7 @@ class DebuggerClient(object):
         major = StreamUtils.read_uint32_le(sock, counter)
         minor = StreamUtils.read_uint32_le(sock, counter)
         patch = StreamUtils.read_uint32_le(sock, counter)
-        platform_revision = None
+        software_revision = None
         packet_length = None
 
         counter.byte_read_count = 0
@@ -401,18 +504,17 @@ class DebuggerClient(object):
             if self.__check_debug(2):
                 print('debug: dclient: reading packet length and platform revision')
             packet_length = StreamUtils.read_uint32_le(sock, counter);
-            platform_revision = StreamUtils.read_int64_le(sock, counter)
+            software_revision = StreamUtils.read_int64_le(sock, counter)
         else:
             if self.__check_debug(2):
                 print('debug: dclient: NOT reading platform revision')
         if self.__check_debug(3):
-            print('debug: dclient: read protocol version={}.{}.{} platform_revision={}'.format(
-                major, minor, patch, platform_revision))
+            print('debug: dclient: read protocol version={}.{}.{} software_revision={}'.format(
+                major, minor, patch, software_revision))
         if packet_length != None:
             assert counter.byte_read_count == packet_length
 
-        self.protocol_version = ProtocolVersion(major, minor, patch)
-        self.protocol_version.set_platform_revision(platform_revision)
+        self.protocol_version = ProtocolVersion(major, minor, patch, software_revision)
         v = self.protocol_version
         if not v.is_valid():
             global_config.do_exit(1,
@@ -420,9 +522,11 @@ class DebuggerClient(object):
                     v.to_user_str()))
 
         # Infer the target's feature set from information in the handshake
+        features = set()
         for feature in ProtocolFeature:
             if self.protocol_version.has_feature(feature):
-                self.__features.add(feature)
+                features.add(feature)
+        self.__features = frozenset(features)
 
     def __invalidate_thread_cache(self):
         self.__cache_threads(None)
@@ -430,7 +534,7 @@ class DebuggerClient(object):
     # Cache the response. If the response is None or has err_code!=ErrCode.OK,
     # the cache entry is erased.
     def __cache_threads(self, response):
-        with self.__cached_threads_lock:
+        with self.__lock:
             self.__cached_threads = response
             self.__cached_thread_stacktraces = None
             self.__cached_thread_stack_variables = None
@@ -439,7 +543,7 @@ class DebuggerClient(object):
     # the cache entry is erased.
     def __cache_thread_stacktrace(self, thread_index, response):
         assert thread_index >= 0
-        with self.__cached_threads_lock:
+        with self.__lock:
             if not self.__cached_thread_stacktraces:
                 self.__cached_thread_stacktraces = list()
             while len(self.__cached_thread_stacktraces) <= thread_index:
@@ -461,7 +565,7 @@ class DebuggerClient(object):
 
         get_child_keys = request.get_child_keys
         assert request
-        with self.__cached_threads_lock:
+        with self.__lock:
             if not self.__cached_thread_stack_variables:
                 self.__cached_thread_stack_variables = dict()
             vars_key = self.__make_cached_variables_key(thread_index,

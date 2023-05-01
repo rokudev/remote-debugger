@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 ########################################################################
-# File: LineEditor.py
+# File: UserInputProcessor.py
 # Requires python 3.5.3 or later
 #
 # NAMING CONVENTIONS:
@@ -32,6 +32,10 @@
 _module_debug_level = 0
 
 import sys, threading, traceback
+
+# SystemExit only exits the current thread, so call it by its real name
+ThreadExit = SystemExit
+
 from .LineEditor import LineEditor
 
 global_config = getattr(sys.modules['__main__'], 'global_config', None)
@@ -118,14 +122,11 @@ class UserInputProcessor(object):
         with self.__lock:
             self.__prompt_lines = prompt_lines
 
-    # If this processor is not actively reading the input, start
-    # doing so
-    def accept_input(self, input_ok):
+    # Print prompt lines, read one line of input from the terminal and send
+    # the line to the input listener.
+    def accept_input(self):
         with self.__lock:
-            if (self._debug_level >= 3) and (input_ok != self.__input_ok):
-                print('debug: uip: accept_input(), ok becomes {},prompt={}'.\
-                    format(input_ok, self.__prompt_lines))
-            self.__input_ok = input_ok
+            self.__input_ok = True
             self.__condition.notify_all()
 
     def simulate_input(self, cmd_str):
@@ -197,7 +198,7 @@ class UserInputProcessor(object):
     def __call__(self):
         try:
             self.run()
-        except SystemExit: raise
+        except ThreadExit: raise
         except: # Yes, catch EVERYTHING
             traceback.print_exc()
             global_config.do_exit(1, "INTERNAL ERROR: uncaught exception")

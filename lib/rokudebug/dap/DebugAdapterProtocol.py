@@ -35,6 +35,9 @@
 import http.client, os, json, pathlib, re, sys, threading, time
 import traceback, zipfile
 
+# SystemExit only exits the current thread, so call it by its real name
+ThreadExit = SystemExit
+
 # Classes from other packages
 from rokudebug.model import AppInstallerClient
 from rokudebug.model import Breakpoint
@@ -128,6 +131,11 @@ class DebugAdapterProtocol(object):
     _class_lock = threading.Lock()
 
     def __init__(self, fin, fout):
+
+        raise NotImplementedError(
+            'Sorry, the Debug Adapter Protocol (DAP)'
+            ' needs maintenance and has been disabled')
+
         self._debug_level = 0
         if self.__check_debug(1):
             do_print('debug:dap: test stdout redirect')
@@ -165,7 +173,7 @@ class DebugAdapterProtocol(object):
     def __call__(self):
         try:
             self.__call_impl()
-        except SystemExit: raise
+        except ThreadExit: raise
         except: # Yes, catch EVERYTHING
             traceback.print_exc(file=sys.stderr)
             global_config.do_exit(1,

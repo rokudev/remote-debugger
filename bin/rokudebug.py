@@ -47,6 +47,10 @@
 from __future__ import print_function
 
 import importlib, os, sys, traceback
+
+# SystemExit only exits the current thread, so call it by its real name
+ThreadExit = SystemExit
+
 try:
 
     #############################################################
@@ -109,7 +113,7 @@ try:
 # Catch any wayward exceptions.
 # Ideally, this should never happen, because the scripts should be
 # handling exceptions locally whenever reasonable.
-except SystemExit: raise
+except ThreadExit: raise
 except:     # Yes, catch EVERYTHING (not just Exception)
     sys.stdout.flush()
     traceback.print_exc(file=sys.stderr)

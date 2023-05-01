@@ -48,6 +48,7 @@ You can [download](https://github.com/rokudev/debug-protocol-vscode-ext-beta) th
 
 ## Change log
 
+- **04-28-2023**: Roku Remote debugger 3.2.0 release. Supports protocol 3.2.0 features (breakpoint verified updates, protocol error updates)
 - **09-14-2022**: Roku Remote debugger 3.1.0 release. Supports protocol 3.1.0 features (conditional breakpoints, packet length, improved error responses)
 - **08-14-2020**: Beta release of [Visual Studio Code extension](https://github.com/rokudev/debug-protocol-vscode-ext-beta). Updated debug command table.
 - **03-29-2020**: Roku Remote debugger 2.0.0 release. Added breakpoint and step commands.  

@@ -45,11 +45,14 @@ def get_file_name(file_path):
         return None
     return os.path.split(file_path)[-1]
 
-def revision_timestamp_to_str(timestamp):
+def revision_timestamp_to_str(timestamp, include_int_value=False):
     rev_time = datetime.datetime.fromtimestamp(
         timestamp / 1000.0, datetime.timezone.utc)
-    rev_time_str = '{}({})'.format(timestamp, 
-        rev_time.strftime("%Y-%m-%dT%H:%M:%S.%fZ").replace("000Z", "Z"))
+    timestamp_str = rev_time.strftime(\
+        "%Y-%m-%dT%H:%M:%S.%fZ").replace("000Z", "Z")
+    rev_time_str = timestamp_str
+    if include_int_value:
+        rev_time_str = '{}({})'.format(timestamp, timestamp_str)
     return rev_time_str
 
 def dump_bytes(bytes, label=None, forceEol=False, maxLen=None):

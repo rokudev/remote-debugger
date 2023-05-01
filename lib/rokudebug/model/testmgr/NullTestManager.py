@@ -13,15 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 ########################################################################
-# File: DAPProtocolMessage.py
-# Requires python 3.5.3 or later
-#
-# Base class(es) for all Debug Adapter Protocol (DAP) message,
+# File: NullTestManager.py
+# Requires python v3.5.3 or later
 #
 # NAMING CONVENTIONS:
 #
-# TypeNames are CamelCase
-# CONSTANT_VALUES are CAPITAL_CASE
+# TypeIdentifiers are CamelCase
+# CONSTANTS are CAPITAL_CASE
 # all_other_identifiers are snake_case
 # _protected members begin with a single underscore '_' (subclasses can access)
 # __private members begin with double underscore: '__'
@@ -33,22 +31,36 @@
 
 import sys
 
-from .DAPTypes import LITERAL
-from .DAPUtils import to_debug_str
+from .TestManager import AbstractTestManager
 
 global_config = getattr(sys.modules['__main__'], 'global_config', None)
-assert global_config    # verbosity, global debug_level, do_exit()
+assert global_config    # verbosity, global debug_level
 
-# Base class for all messages sent over the Debug Adapter Protocol (DAP),
-# in both directions. That includes requests, responses, and events.
-class DAPProtocolMessage(object):
-    def __init__(self, msg_type):
-        self.type = msg_type        # str
 
-        # The spec defines 'seq' as a required field, but it does not seem
-        # to be actually required in messages from the adapter to the
-        # client.
-        self.seq = None         # int
+# No-op test manager, used when no tests are specified
+class NullTestManager(AbstractTestManager):
 
-    def __str__(self):
-        return to_debug_str(self)
+    def add_listener(self, listener) -> None:
+        return None
+
+    def get_current_test(self) -> None:
+        return None
+
+    def get_current_test_name(self) -> None:
+        return None
+
+    def count_tests(self) -> int:
+        return 0
+
+    def get_tests_sorted(self) -> list:
+        return []
+
+    def set_current_test(self, test_name) -> None:
+        return None
+
+    def current_test_is_running(self) -> bool:
+        return False
+
+    # Test has run and is complete, whether failed or successful
+    def current_test_is_done(self) -> bool:
+        return False

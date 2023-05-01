@@ -21,7 +21,9 @@ from .AppInstallerClient import AppInstallerClient
 from .Breakpoint import Breakpoint		# REMIND: hide this inside DebuggerClient
 from .BreakpointManager import BreakpointManager  # REMIND: hide this inside DebuggerClient
 from .DebuggerRequest import CmdCode
-from .DebuggerClient import DebuggerClient
+from .DebuggerRequest import DebuggerRequest
+from .DebuggerRequest import DebuggerRequest_NoParamsBase
+from .DebuggerClient import AbstractDebuggerClient, DebuggerClient
 from .DebuggerRequest import DebuggerRequest
 from .DebuggerRequest import DebuggerRequest_AddBreakpoints
 from .DebuggerRequest import DebuggerRequest_AddConditionalBreakpoints
@@ -35,17 +37,18 @@ from .DebuggerRequest import DebuggerRequest_Stop
 from .DebuggerRequest import DebuggerRequest_Threads
 from .DebuggerRequest import DebuggerRequest_Variables
 from .DebuggerRequest import DebuggerRequest_Execute
+from .DebuggerRequest import StepType
 from .DebuggerResponse import DebuggerUpdate
 from .DebuggerResponse import ErrCode
-from .DebuggerRequest import StepType
 from .DebuggerResponse import ThreadStopReason
+from .DebuggerResponse import ProtocolError
 from .DebuggerResponse import UpdateType
 from .DebuggerResponse import VariableType
 from .FakeDebuggerClients import FakeDebuggerClient
-from .FakeDebuggerClients import FakeDebuggerControlListener
 from .MonotonicClock import MonotonicClock
 from .ProtocolVersion import ProtocolFeature
 from .ProtocolVersion import ProtocolVersion
+from .SourceCodeInspector import LibrarySourceSpecifier
 from .SourceCodeInspector import SourceCodeInspector
 from .Verbosity import Verbosity
 

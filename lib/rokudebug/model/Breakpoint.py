@@ -47,6 +47,7 @@ class Breakpoint(object):
         self.line_num = line_num
         self.local_id = None    # ID assigned locally, presented to user
         self.remote_id = None   # ID assigned by debugging target
+        self.is_verified = False
         self.ignore_count = ignore_count
         self.cond_expr = cond_expr
         if not self.cond_expr:  # Change empty string to None
@@ -57,6 +58,9 @@ class Breakpoint(object):
 
     def _validate(self):
         assert self.cond_expr == None or len(self.cond_expr) > 0
+
+    def set_verified(self, verified):
+        self.is_verified = verified
 
     # The ID used locally and presented to the user
     def set_local_id(self, local_id):
@@ -78,6 +82,8 @@ class Breakpoint(object):
             s += ',localid={}'.format(self.local_id)
         if self.remote_id:
             s += ',rmtid={}'.format(self.remote_id)
+        if self.is_verified:
+            s += ',verified'
         if self.ignore_count:
             s += ',ignorecount={}'.format(self.ignore_count)
         if self.cond_expr:

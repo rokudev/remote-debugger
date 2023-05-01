@@ -19,8 +19,32 @@
 # Defines which protocol versions are supported by this debugger
 #
 
+########################################################################
+# Unit test setup
+########################################################################
+__RUN_UNIT_TESTS = __name__ == '__main__'
+if __RUN_UNIT_TESTS:
+    import enum, sys
+    @enum.unique
+    class Verbosity(enum.IntEnum):
+        SILENT      = 0,
+        ERRORS_ONLY = 1,
+        NORMAL      = 2,
+        HIGH        = 3,
+        HIGHER      = 4,
+        HIGHEST     = 5,
+
+    class UnitTestConfig(object):
+        def __init__(self):
+            self.verbosity = Verbosity.NORMAL
+
+    sys.modules['__main__'].global_config = UnitTestConfig()
+########################################################################
+
 import enum, sys
-from .Verbosity import Verbosity
+if not __RUN_UNIT_TESTS:
+    from .Verbosity import Verbosity
+    from rokudebug.model.DebugUtils import revision_timestamp_to_str
 
 global_config = getattr(sys.modules['__main__'], 'global_config', None)
 assert global_config    # verbosity, global debug_level, do_exit()
@@ -33,7 +57,6 @@ _PATCH_LEVEL_MAX = 999
 
 @enum.unique
 class ProtocolFeature(enum.IntEnum):
-    UNDEF = 0,
     ATTACHED_MESSAGE_DURING_STEP_BUG = enum.auto()  # incorrect THREAD_ATTACHED during step in/over/out
     BAD_LINE_NUMBER_IN_STACKTRACE_BUG = enum.auto()
     BREAKPOINTS = enum.auto()
@@ -47,6 +70,7 @@ class ProtocolFeature(enum.IntEnum):
     CONDITIONAL_BREAKPOINTS = enum.auto()
     ERROR_FLAGS = enum.auto()                   # Error responses include additional data
     CONDITIONAL_BREAKPOINTS_ALLOW_EMPTY_CONDITION = enum.auto() # empty condition = no condition
+    IMPROVED_LINE_NUMBERS_IN_TRACES = enum.auto() # Threads and Stacktrace responses have better line numbers
 
     def to_user_string(self):
         feature = ProtocolFeature
@@ -57,51 +81,79 @@ class ProtocolFeature(enum.IntEnum):
             user_string = "stop_on_launch"  # To user, it's not "always"
         return user_string
 
+# A ProtocolVersion is major.minor.patch_level (e.g., 3.2.1), and
+# an optional software revision timetamp may also be included. The
+# revision timestamp is primarily used to distinguish between pre-
+# release build, similar to a build number. When comparing two
+# versions, the revision_timestamp is only considered if the major
+# minor,patch_level are equal and BOTH version have a revision timestamp.
+#
+# This is a small and lightweight class. As such, there are no internal
+# data structures created to speed up feature queries and those
+# queries can be inefficient (e.g., O(n) based on the total possible
+# number of features). Clients should cache query results needed regularly.
 class ProtocolVersion(object):
 
-    # @param major, minor, patch_level : int
-    def __init__(self, major, minor, patch_level):
+    # @param major, minor, patch_level, software_revision_timestamp : int
+    def __init__(self, major, minor, patch_level, software_revision_timestamp=None):
         self.major = major
         self.minor = minor
         self.patch_level = patch_level
-        self.__platform_revision = None
+        self.__software_revision = software_revision_timestamp
 
     def __str__(self):
         return self.to_user_str()
 
+    # software_revision is used iff major, minor, patch are equal and
+    # both self and other have a software_revision.
     def __eq__(self, other):
-        return ProtocolVersion.__static_to_int(self) == \
-                ProtocolVersion.__static_to_int(other)
+        isit = self.major == other.major and \
+            self.minor == other.minor and \
+            self.patch_level == other.patch_level
+        if isit and ProtocolVersion.__have_revisions(self, other):
+            isit = self.__software_revision == other.__software_revision
+        return isit
+
     def __ne__(self, other):
-        return ProtocolVersion.__static_to_int(self) != \
-                ProtocolVersion.__static_to_int(other)
+        return not self == other
+
+    # software_revision is used iff major, minor, patch are equal and
+    # both self and other have a software_revision.
     def __gt__(self, other):
-        return ProtocolVersion.__static_to_int(self) > \
-                ProtocolVersion.__static_to_int(other)
+        if self.major > other.major:
+            return True
+        elif self.major == other.major:
+            if self.minor > other.minor:
+                return True
+            elif self.minor == other.minor:
+                if self.patch_level > other.patch_level:
+                    return True
+                elif self.patch_level == other.patch_level and \
+                    ProtocolVersion.__have_revisions(self, other):
+                        return self.__software_revision > other.__software_revision
+        return False
+
     def __ge__(self, other):
-        return ProtocolVersion.__static_to_int(self) >= \
-                ProtocolVersion.__static_to_int(other)
+        return self > other or self == other
+
+    # software_revision is used iff major, minor, patch are equal and
+    # both self and other have a software_revision.
     def __lt__(self, other):
-        return ProtocolVersion.__static_to_int(self) < \
-                ProtocolVersion.__static_to_int(other)
+        if self.major < other.major:
+            return True
+        elif self.major == other.major:
+            if self.minor < other.minor:
+                return True
+            elif self.minor == other.minor:
+                if self.patch_level < other.patch_level:
+                    return True
+                elif self.patch_level == other.patch_level and \
+                    ProtocolVersion.__have_revisions(self, other):
+                        return self.__software_revision < other.__software_revision
+        return False
+
     def __le__(self, other):
-        return ProtocolVersion.__static_to_int(self) <= \
-                ProtocolVersion.__static_to_int(other)
-
-    @staticmethod
-    def get_max_version():
-        max_ver = ProtocolVersion(_MAJOR_VERSION_MAX, _MINOR_VERSION_MAX, _PATCH_LEVEL_MAX)
-        assert max_ver.is_valid()
-        return max_ver
-
-    # During a platform release cycle, the debug target's behavior may be
-    # different for different platform_revision timestamps. This is similar
-    # to a build number and should never affect production builds.
-    def set_platform_revision(self, platform_revision):
-        self.__platform_revision = platform_revision
-
-    def get_platform_revision(self):
-        return self.__platform_revision
+        return self < other or self == other
 
     # Very simplistic check on the validity of the version parts
     # (e.g., not negative, not ridiculously large)
@@ -111,28 +163,34 @@ class ProtocolVersion(object):
                 self.patch_level >= 0 and self.patch_level <= _PATCH_LEVEL_MAX
 
     # Safe for display to user
-    def to_user_str(self):
-        return '{}.{}.{}'.format(
-            self.major, self.minor, self.patch_level)
+    def to_user_str(self, include_software_revision=False):
+        s = '{}.{}.{}'.format(self.major, self.minor, self.patch_level)
+        if (include_software_revision and self.__software_revision):
+            s += '+{}({})'.format(self.__software_revision,
+                revision_timestamp_to_str(self.__software_revision))
+        return s
 
+    # Efficiency: O(n), based on total number of features possible
+    # Clients are advised to cache the results if needed regularly.
     # @param feature enum ProtocolFeature
+    # @see class ProtocolVersion
     def has_feature(self, feature):
         has_it = False
-        enabled_by_revision = False
-        disabled_by_revision = False
+
+        # A feature under development can gated on a software revision
+        # timestamp (which is similar to a build number), in addition
+        # to a protocol version.
+        #
+        # e.g., self >= ProtocolVersion(3,2,0,1662563049603)
 
         # 1.1
         if feature == ProtocolFeature.STEP_COMMANDS:
             has_it = self >= ProtocolVersion(1,1,0)
 
-        # 1.1.1 - 3.1.1+1660254781319
+        # 1.1.1 - 3.1.x
         elif feature == ProtocolFeature.BAD_LINE_NUMBER_IN_STACKTRACE_BUG:
-            has_it = self >= ProtocolVersion(1,1,1) and self < ProtocolVersion(3,1,1)
-            if not has_it:
-                if self == ProtocolVersion(3,1,1) and self.__platform_revision < 1660254781319:
-                    # pre-release build still has this bug
-                    has_it = True
-                    enabled_by_revision = True
+            has_it = self >= ProtocolVersion(1,1,1) and \
+                                self < ProtocolVersion(3,2,0)
 
         # 1.2
         elif feature == ProtocolFeature.BREAKPOINTS:
@@ -158,56 +216,27 @@ class ProtocolVersion(object):
         # 3.1
         elif feature == ProtocolFeature.BREAKPOINTS_URI_SUPPORT:
             has_it = self >= ProtocolVersion(3,1,0)
-            if has_it:
-                if self.__platform_revision and self.__platform_revision < 1650905541605:
-                    # pre-release build does not have feature
-                    has_it = False
-                    disabled_by_revision = True
         elif feature == ProtocolFeature.CASE_SENSITIVITY:
             has_it = self >= ProtocolVersion(3,1,0)
         elif feature == ProtocolFeature.CONDITIONAL_BREAKPOINTS:
             has_it = self >= ProtocolVersion(3,1,0)
         elif feature == ProtocolFeature.ERROR_FLAGS:
             has_it = self >= ProtocolVersion(3,1,0)
-            if has_it:
-                if self.__platform_revision and self.__platform_revision < 1658337558223:
-                    has_it = False
-                    disabled_by_revision = True
 
         # 3.1.1
         elif feature == ProtocolFeature.CONDITIONAL_BREAKPOINTS_ALLOW_EMPTY_CONDITION:
             has_it = self >= ProtocolVersion(3,1,1)
 
-        if global_config.debug_level >= 1: # 1 = validation
-            if has_it:
-                assert not disabled_by_revision, f'feature={str(feature)}'
-            else:
-                assert not enabled_by_revision, f'feature={str(feature)}'
-            assert not (enabled_by_revision and disabled_by_revision)
-
-        if enabled_by_revision and global_config.verbosity >= Verbosity.NORMAL:
-            print('info: enabling feature based on revision timestamp: {}'.format(str(feature)))
-        if disabled_by_revision and global_config.verbosity >= Verbosity.NORMAL:
-            print('info: disabling feature based on revision timestamp: {}'.format(str(feature)))
+        # 3.2
+        elif feature == ProtocolFeature.IMPROVED_LINE_NUMBERS_IN_TRACES:
+            has_it = self >= ProtocolVersion(3,2,0)
 
         return has_it
 
-    # In python 3, "All integers are implemented as long integer
-    # objects of arbitrary size."
-    def __to_int(self):
-        assert self.is_valid()
-        # python has unlimited precision
-        return self.major * int(1e+9) + \
-                    self.minor * int(1e+6) + \
-                    self.patch_level
-
-    #@return large int representing protocol_version, 0 if protocol_version==None
     @staticmethod
-    def __static_to_int(protocol_version):
-        if not protocol_version:
-            return 0
-        return protocol_version.__to_int()
-
+    def __have_revisions(pver1, pver2):
+        return pver1.__software_revision != None and \
+            pver2.__software_revision != None
 
 ########################################################################
 # Global functions
@@ -240,3 +269,55 @@ def check_debuggee_protocol_version(debuggee_version):
 
 def do_exit(exit_code, msg=None):
     global_config.do_exit(exit_code, msg)
+
+########################################################################
+# UNIT TESTS
+########################################################################
+
+if __RUN_UNIT_TESTS:
+    tsearly = 1675381652000
+    tslate  = 1675381660000
+
+    # test ==
+    assert ProtocolVersion(3,0,0) == ProtocolVersion(3,0,0)
+    assert ProtocolVersion(3,2,0) == ProtocolVersion(3,2,0)
+    assert ProtocolVersion(3,2,1) == ProtocolVersion(3,2,1)
+    assert ProtocolVersion(3,0,0,tsearly) == ProtocolVersion(3,0,0)
+    assert ProtocolVersion(3,0,0) == ProtocolVersion(3,0,0,tsearly)
+    assert ProtocolVersion(3,0,0,tsearly) == ProtocolVersion(3,0,0,tsearly)
+    assert not ProtocolVersion(4,0,0) == ProtocolVersion(3,0,0)
+    assert not ProtocolVersion(3,1,0) == ProtocolVersion(3,0,0)
+    assert not ProtocolVersion(3,2,1) == ProtocolVersion(3,2,0)
+
+    # test >
+    assert ProtocolVersion(4,3,2) > ProtocolVersion(3,9,9)
+    assert ProtocolVersion(4,3,2) > ProtocolVersion(4,2,9)
+    assert ProtocolVersion(4,3,2) > ProtocolVersion(4,3,1)
+    assert ProtocolVersion(4,3,2,tslate) > ProtocolVersion(4,3,2,tsearly)
+    assert ProtocolVersion(3,9,0,tsearly) > ProtocolVersion(3,8,0)
+    assert ProtocolVersion(3,9,0) > ProtocolVersion(3,8,0,tslate)
+    assert not ProtocolVersion(4,0,0) > ProtocolVersion(4,0,0)
+    assert not ProtocolVersion(3,1,0) > ProtocolVersion(3,2,0)
+    assert not ProtocolVersion(3,2,1) > ProtocolVersion(3,2,2)
+    assert not ProtocolVersion(3,0,0,tsearly) > ProtocolVersion(3,0,0,tslate)
+    assert not ProtocolVersion(3,8,0,tslate) > ProtocolVersion(3,8,0)
+    assert not ProtocolVersion(3,8,0) > ProtocolVersion(3,8,0,tslate)
+
+    # test <
+    assert ProtocolVersion(4,3,2) < ProtocolVersion(5,9,9)
+    assert ProtocolVersion(4,3,2) < ProtocolVersion(4,4,9)
+    assert ProtocolVersion(4,3,2) < ProtocolVersion(4,3,9)
+    assert ProtocolVersion(4,3,2,tsearly) < ProtocolVersion(4,3,2,tslate)
+    assert ProtocolVersion(4,3,2,tsearly) < ProtocolVersion(4,3,3)
+    assert ProtocolVersion(4,3,2,tsearly) <  ProtocolVersion(4,3,2, tslate)
+    assert not ProtocolVersion(5,9,9) < ProtocolVersion(4,3,2)
+    assert not ProtocolVersion(4,4,9) < ProtocolVersion(4,3,2)
+    assert not ProtocolVersion(4,3,3) < ProtocolVersion(4,3,2)
+    assert not ProtocolVersion(4,3,2,tslate) < ProtocolVersion(4,3,2,tsearly)
+    assert not ProtocolVersion(4,3,3) < ProtocolVersion(4,3,2,tsearly)
+    assert not ProtocolVersion(4,3,2,tslate) <  ProtocolVersion(4,3,2,tsearly)
+
+    # Don't need to test !=, <=, nor >=, because they are implemented
+    # with ==, <, >
+
+    print('ProtocolVersion unit tests: PASS')

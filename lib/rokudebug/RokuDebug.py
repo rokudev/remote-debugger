@@ -36,8 +36,10 @@
 
 # System imports
 import argparse, atexit, datetime, enum, inspect, ipaddress, os, pathlib
-import platform, signal, sys, time, threading, traceback
+import platform, signal, sys, tempfile, time, threading, traceback
 
+# SystemExit only exits the current thread, so call it by its real name
+ThreadExit = SystemExit
 
 ########################################################################
 # GLOBAL CONFIGURATION
@@ -58,6 +60,7 @@ class GlobalConfig(object):
         # functions
         self.do_exit = None             # function: always use this to exit
         self.set_exit_code = None       # function: Override exit_code passed to do_exit()
+        self.get_is_exiting = None      # function: is rokudebug exiting?
         self.get_monotonic_time = None
         self.get_version_str = None
 
@@ -73,9 +76,11 @@ from .model import AppInstallerClient
 from .model import DebuggerClient
 from .model import DebugUtils
 from .model import FakeDebuggerClient       # used for debugging
+from .model import LibrarySourceSpecifier
 from .model import MonotonicClock
 from .model import ProtocolFeature
 from .model import SourceCodeInspector
+from .model.testmgr import NullTestManager, TestManager
 from .model import Verbosity
 from .model import get_supported_protocols_str, check_debuggee_protocol_version
 from .cli import CommandLineInterface
@@ -83,7 +88,7 @@ from .dap import DebugAdapterProtocol
 
 # When changing the version number, be sure to update SOFTWARE_REVISION_TIMESTAMP
 VERSION_MAJOR        = 3            # int major
-VERSION_MINOR        = 1            # int minor
+VERSION_MINOR        = 2            # int minor
 VERSION_PATCH_LEVEL  = 0            # int patch level
 
 # Software revision timestamp is similar to a build number, and is primarly
@@ -91,7 +96,7 @@ VERSION_PATCH_LEVEL  = 0            # int patch level
 # 1970-01-01T00:00:00.000Z (64 bits) and must be updated when any change is
 # made that may affect the behavior of this program.
 # Calculate timestamp on linux: date -u +%s%3N    or   expr 1000 \* `date -u +%s`
-SOFTWARE_REVISION_TIMESTAMP = 1658780395268 # 64-bit long int
+SOFTWARE_REVISION_TIMESTAMP = 1675444061659 # 64-bit long int
 
 # We treat signals as names because not all enum values are
 # available on all platforms
@@ -109,16 +114,16 @@ class RokuDebugOptions(object):
         self.channel_file = None
         self.dap_log_file_path = None
         self.no_execute = False
-        self.run_mode = RunMode.DEBUG
+        self.run_mode = RunMode.CLI
         self.stop_target_on_launch = False
         self.target_ip = None
         self.target_pass = None
 
 @enum.unique
 class RunMode(enum.IntEnum):
-    UNDEF = 0
     DAP = enum.auto()     # Run as a Debug Adapter Protocol server/bridge
-    DEBUG = enum.auto()   # Upload and run the channel, attach to debuggee
+    CLI = enum.auto()     # Go to command-line interface, don't load channel
+    DEBUG = enum.auto()   # Upload and run the channel, attach to debuggee. go to CLI
     REMOVE = enum.auto()  # Remove installed channel
     RUN = enum.auto()     # Upload and run the channel, do not attach to debuggee
 
@@ -129,12 +134,13 @@ class RunMode(enum.IntEnum):
         return self.name.lower()    # pylint: disable=no-member
 
 
-# This must be a global singleton
+# This is the primary entry point for this script. Must be a global singleton.
 class RokuDebug(object):
-    rokudebug_init_lock = threading.Lock()
+    __lifecycle_lock = threading.RLock()
+    __lifecycle_cond_var = threading.Condition(lock=__lifecycle_lock)
 
     def __init__(self):
-        with RokuDebug.rokudebug_init_lock:
+        with RokuDebug.__lifecycle_lock:
             self.__init_nolock()
 
     def __init_nolock(self):
@@ -154,7 +160,12 @@ class RokuDebug(object):
         self._exit_cond_var = threading.Condition(lock=threading.Lock()) # main thread waits on this
         self._exit_code = None          # None is not 0
 
-        self.__debug_no_sideload = False
+        self.__tmp_dir = None           # Created iff needed, use self.get_tmp_dir_path()
+        self.__test_mgr = None          # Always exists, may have no tests
+        self.__lib_sources = []        # Source not in channel package (e.g., a library)
+        self.__test_dirs = []           # Directories to load tests from
+        self.__run_test_name = None     # Name of test to auto-run on startup
+        self.__debug_fake_connection = False
         self.__interface_thread = None  # runs cli, set in main()
         self.__monotonic_clock = None   # set in main()
         self.__debugger_client = None
@@ -165,8 +176,10 @@ class RokuDebug(object):
         #    localout, localerr, targetout, targeterr
         self.__output_controller = None
 
-        self.__shutdown_lock = threading.RLock()
+        # protected with RokuDebug.__lifecycle_lock
         self.__is_shut_down = False
+        self.__is_cli_running = False
+
         # Unsupported signals will have a value of None
         self.__signal_name_to_enum = {
             CTRL_BREAK_EVENT_LITERAL:None,
@@ -189,19 +202,20 @@ class RokuDebug(object):
 
     def main(self):
         try:
-            return self.__main_impl()
-        except BaseException as e:
-            if self.__check_debug(2):
-                print('debug: exception in main() (NORMALLY NOT A PROBLEM):')
-                traceback.print_exc(file=sys.stdout)
-            if self.__check_debug(1):
-                assert not threading.current_thread().daemon, \
-                    "debug: exception on non-daemon thread will not cause exit"
-                non_daemons = [thr for thr in threading.enumerate() \
-                                                    if not thr.daemon]
-                assert len(non_daemons) == 1, \
-                    'debug: other non-daemon thread(s) will not allow exit: {}'.\
-                        format(repr(non_daemons))
+            try:
+                return self.__main_impl()
+            except ThreadExit: raise	# Normal exit
+            except BaseException as e:
+                print('INTERNAL ERROR: Exception in main():')
+                traceback.print_exc(file=sys.stderr)
+                # do_exit() raises ThreadExit exception on this main (non-daemon) thread
+                do_exit(1, 'INTERNAL ERROR: exception in main(): {}'.format(e))
+        except ThreadExit as e:
+            # Normal shutdown path - exiting this thread exits the process
+            # Wait for all daemon threads to exit, because if they try
+            # to print anything while this thread terminates, the python
+            # interpreter will have a hissy fit and dump a core.
+            self.shutdown()
             raise e
         raise AssertionError('Should not reach this line')
 
@@ -218,6 +232,7 @@ class RokuDebug(object):
 
         self.__monotonic_clock = MonotonicClock(global_config.debug_level)
         self.__print_startup_info()
+        self.__init_test_mgr()
 
         if self.options.run_mode == RunMode.DAP:
             self.__dap = DebugAdapterProtocol(self.__orig_stdin,
@@ -228,28 +243,23 @@ class RokuDebug(object):
                     name='Interface', target=self, daemon=True)
             self.__interface_thread.start()
 
-        # Python delivers all signals on the main thread. This main thread
-        # idles, waiting for signals (e.g., KeyboardInterrupt), which
-        # simplifies re-entrancy issues if this thread were doing other work.
-
-        # Do a busy wait as a backup, in case there is lock contention on
-        # exit and a notify cannot be done (e.g., signal-handling recursion
-        # on this thread).
+        # Idle and wait for events, signals, and interrupts. This thread
+        # sits idle because only this initial/main thread can exit this
+        # process cleanly, because sys.exit() (and the ThreadExit exception)
+        # are ignored on other threads. Also, python will deliver all
+        # signals to this initial/main thread.
         if self.__check_debug(3):
             print('debug:main: main() idling...')
-        try:
-            with self._exit_cond_var:
-                while not self._exit_now:
-                    self._exit_cond_var.wait(5)
-        except SystemExit: raise
-        except: # Yes, catch EVERYTHING
-            traceback.print_exc()
-            do_exit(1, "INTERNAL ERROR: Uncaught exception")
+        with self._exit_cond_var:
+            while not self._exit_now:
+                # As a backup, poll periodically without a cond_var
+                # notification.
+                self._exit_cond_var.wait(5)
 
         if self.__check_debug(2):
             print('debug: main thread exits')
         do_exit(0)
-    # END main()
+    # END main_impl()
 
     # Invoked with --no-execute to validate files in self.options
     # Exits script, never returns
@@ -278,7 +288,7 @@ class RokuDebug(object):
     def __call__(self):
         try:
             self.__run_interface()
-        except SystemExit: raise
+        except ThreadExit: raise
         except: # Yes, catch EVERYTHING
             traceback.print_exc()
             global_config.do_exit(1, 'INTERNAL ERROR: Uncaught exception')
@@ -296,7 +306,9 @@ class RokuDebug(object):
         installer = AppInstallerClient(self.options.target_ip,
                         self.options.target_pass)
 
-        if self.options.run_mode == RunMode.DEBUG:
+        if self.options.run_mode == RunMode.CLI:
+            self.__start_plain_cli(installer)
+        elif self.options.run_mode == RunMode.DEBUG:
             self.__debug_channel(installer)
         elif self.options.run_mode == RunMode.REMOVE:
             self.__remove_channel(installer)
@@ -310,6 +322,12 @@ class RokuDebug(object):
 
     def get_monotonic_time(self):
         return self.__monotonic_clock.get_time()
+
+    def get_tmp_dir_path(self):
+        with self.__lifecycle_lock:
+            if not self.__tmp_dir:
+                self.__tmp_dir = tempfile.TemporaryDirectory(prefix='rrdb_')
+        return self.__tmp_dir.name
 
     def __install_signal_handlers(self):
         # MS-Windows (and probably other platforms) don't support signals,
@@ -352,12 +370,13 @@ class RokuDebug(object):
 
         ################################################################
         # PRIORITY ARGUMENT PARSING
-        # Process arguments that take effect early and affect the
-        # behavior of other options.
+        # Process arguments that take effect early and affect the behavior
+        # of other options, regardless of their order on the command line.
         ################################################################
 
 
         ##### PRIORITY 0 ARGS #####
+        # Arguments that affect other arguments, regardless of order
 
         # If Debug Adapter Protocol (DAP) is specified, stdin/stdout
         # are used for the protocol and NO other I/O can go to those
@@ -388,6 +407,9 @@ class RokuDebug(object):
 
         if args.dap:
             options.run_mode = RunMode.DAP
+            raise NotImplementedError(
+              'Sorry, the Debug Adapter Protocol (DAP)'
+                  ' needs maintenance and has been disabled')
         if args.dap_log_file_path:
             if options.run_mode != RunMode.DAP:
                 do_exit(1, '--dap-log only valid with --dap')
@@ -407,21 +429,36 @@ class RokuDebug(object):
 
 
         ##### PRIORITY 1 ARGS #####
+        # More options that affect other options, regardless of order
 
-        # --debug-* arguments exist in public distros but are not documented
-        add_arg_d = lambda parser : \
-            parser.add_argument('-d', dest='debug_level',
-                action='count',default=0,
-                help=argparse.SUPPRESS)
-        # --debug-* arguments exist in public distros but are not documented
-        add_arg_debuglevel = lambda parser : \
+        def add_arg_debug_level(parser, include_help):
+            help_arg = 'Debug this script: 1=silent validation, 2-10=more output' \
+                if include_help else argparse.SUPPRESS
             parser.add_argument('--debug-level', dest='debug_level', type=int,
                 action='store',default=0,
-                help=argparse.SUPPRESS)
+                help=help_arg)
+
+        def add_arg_debug(parser, include_help=True):
+            help_arg = 'Upload, run, and debug channel (default)' \
+                    if include_help else argparse.SUPPRESS
+            parser.add_argument('--debug', dest='debug_channel',
+                action='store_true',default=False,
+                help = help_arg)
+
+        def add_arg_long_help(parser, include_help):
+            help_arg = 'Show long help with debugging and test options, then exit' \
+                if include_help else argparse.SUPPRESS
+            parser.add_argument('--long-help', dest='long_help',
+                action='store_true',default=False,
+                help=help_arg)
 
         parser = argparse.ArgumentParser(add_help=False)
-        add_arg_d(parser)
-        add_arg_debuglevel(parser)
+        add_arg_debug_level(parser, False)
+        add_arg_long_help(parser, False)
+        # --debug is not a high-priority arg, but it needs to be here
+        # so that it is ignored for now, rather than being interpreted
+		# as --debug-level.
+        add_arg_debug(parser, False)
         args, _ = parser.parse_known_args()
 
         # Global debug level (can be overridden in modules)
@@ -430,6 +467,8 @@ class RokuDebug(object):
         if options.run_mode == RunMode.DAP and self.__check_debug(2):
             print('debug: Testing stdout redirect to DAP log')
             print('debug: Testing stderr redirect to DAP log', file=sys.stderr)
+
+        show_long_help_and_exit = args.long_help
 
         # Make sure we don't use stale objects, below
         parser = None
@@ -451,11 +490,10 @@ class RokuDebug(object):
         # are added.
         parser = argparse.ArgumentParser()
         parser.description = 'Client for the Roku debugging protocol'
+        add_arg_long_help(parser, True)
         add_arg_dap(parser)
         add_arg_dap_log_file(parser)
-        parser.add_argument('--debug', dest='debug_channel',
-            action='store_true',default=False,
-            help = 'Upload, run, and debug channel (default)')
+        add_arg_debug(parser)
         add_arg_no_execute(parser)
         parser.add_argument('--remove', dest='remove_channel',
             action='store_true', default=False,
@@ -493,23 +531,51 @@ class RokuDebug(object):
             help='Print version of this program and exit')
 
         # Collect the channel file path
-        parser.add_argument('channelFile', nargs='?')
+        parser.add_argument('channel_file', nargs='?')
 
-        ################################
-        # --debug-* arguments are used to debug this script. The options
-        # exist in public distros, but are not documented.
-        add_arg_d(parser)
-        add_arg_debuglevel(parser)
-        parser.add_argument("--debug-no-sideload", dest='debug_no_sideload',
+        ################################################################
+        # Options that only appear with --long-help
+        # --debug-* arguments are used to debug this script.
+        add_arg_debug_level(parser, show_long_help_and_exit)
+        parser.add_argument("--debug-fake-connection", dest='debug_fake_connection',
             action='store_true', default=False,
-            help=argparse.SUPPRESS)
+            help='Don\'t sideload channel, go straight into command-line with fake connection.'\
+                ' Useful when developing this script'
+                if show_long_help_and_exit else argparse.SUPPRESS)
+
         # allow breakpoints like "components/KeyHandler.brs" w/o lib: or pkg: URI scheme
         parser.add_argument('--debug-preserve-breakpoint-path',
             dest='debug_preserve_breakpoint_path',
             action='store_true', default=False,
-            help=argparse.SUPPRESS)
-        ################################
+            help='Don\'t add pkg: and lib: prefixes to breakpoint paths'\
+                if show_long_help_and_exit else argparse.SUPPRESS)
 
+        # load additional source directory
+        parser.add_argument('--add-lib-src', dest='lib_src',
+            action='append', default=[],
+            help='Add source for library: "mylibname:/path/to/source"'
+                ', may be used multiple times')
+
+        # load external tests
+        # dest appears in help, so name it accordingly: --add-test-dir TEST_DIR
+        parser.add_argument('--add-test-dir', dest='test_dir',
+            action='append', default=[],
+            help='Load external tests, may be used multiple times'\
+                if show_long_help_and_exit else argparse.SUPPRESS)
+
+        # load external tests
+        # dest appears in help, so name it accordingly: --run-test TEST_NAME
+        parser.add_argument('--run-test', dest='test_name', type=str,
+            action='store', default=None,
+            help='Run an externally-loaded test'\
+                if show_long_help_and_exit else argparse.SUPPRESS)
+
+        ################################################################
+
+        if show_long_help_and_exit:
+            parser.parse_args(['--help'])
+            if self.__check_debug(1):
+                raise AssertionError('parse_args() did not exit')
         args = parser.parse_args()
 
         #
@@ -555,49 +621,71 @@ class RokuDebug(object):
 
         # Channel operation (debug/run, mutually exclusive)
         # channel_required must be set for each operation
-        run_modes_selected = list()
+        run_modes_selected = []
         if args.dap:
             channel_required = False
             options.run_mode = RunMode.DAP
-            run_modes_selected.append(options.run_mode)
+            run_modes_selected.append(options.run_mode.to_option_str())
         if args.debug_channel:
             channel_required = True
             options.run_mode = RunMode.DEBUG
-            run_modes_selected.append(options.run_mode)
+            run_modes_selected.append(options.run_mode.to_option_str())
         if args.remove_channel:
             channel_required = False
             options.run_mode = RunMode.REMOVE
-            run_modes_selected.append(options.run_mode)
+            run_modes_selected.append(options.run_mode.to_option_str())
         if args.run_channel:
             channel_required = True
             options.run_mode = RunMode.RUN
-            run_modes_selected.append(options.run_mode)
+            run_modes_selected.append(options.run_mode.to_option_str())
+        if args.test_name:
+            channel_required = False
+            options.run_mode = RunMode.DEBUG
+            run_modes_selected.append('--run-test')
 
         if not len(run_modes_selected):
-            if global_config.verbosity >= Verbosity.HIGH:
-                print('info: no operation specified, defaulting to --debug')
-            options.run_mode = RunMode.DEBUG
-            channel_required = True
+            if args.channel_file:
+                options.run_mode = RunMode.DEBUG
+                channel_required = True
+                if global_config.verbosity >= Verbosity.HIGH:
+                    print('info: no mode specified for channel, defaulting to --debug')
+            else:
+                options.run_mode = RunMode.CLI
+                channel_required = False
+                if global_config.verbosity >= Verbosity.HIGH:
+                    print('info: no mode and no channel specified, going to command line')
+            run_modes_selected.append(options.run_mode.to_option_str())
         elif len(run_modes_selected) > 1:
-            msg = 'Options are incompatible: {}'.format(
-                ' '.join(mode.to_option_str() for mode in run_modes_selected))
+            msg = 'Options are incompatible: {}'.format(' '.join(run_modes_selected))
             do_exit(1, msg)
+        mode_arg = run_modes_selected[0]
 
-        # channelFile
-        if args.channelFile:
+        # channel_file
+        if args.channel_file:
             if not channel_required:
-                do_exit(1, 'channelFile not allowed with {}.{}'.format(
-                    options.run_mode.to_option_str(),use_help_str))
-            self.options.channel_file = args.channelFile
+                do_exit(1, 'channel file not allowed with {}.{}'.format(mode_arg, use_help_str))
+            self.options.channel_file = args.channel_file
         else:
             if channel_required:
-                do_exit(1, 'Channel file required with {}.{}'.format(
-                    options.run_mode.to_option_str(),use_help_str))
+                do_exit(1, 'Channel file required with {}.{}'.format(mode_arg, use_help_str))
             self.options.channel_file = None
 
-        self.__debug_no_sideload = args.debug_no_sideload
-        if self.__debug_no_sideload:
-            global_config.debug_level = max(global_config.debug_level, 1) # enable debug validation
+        self.__debug_fake_connection = args.debug_fake_connection
+        if self.__debug_fake_connection:
+            global_config.debug_level = max(global_config.debug_level, 1) # 1 = internal validation
+
+        for lib_src_spec in args.lib_src:
+            try:
+                self.__lib_sources.append(LibrarySourceSpecifier(lib_src_spec))
+            except ValueError as e:
+                do_exit(1, 'bad library source specifier: {}'.format(e))
+
+        if args.test_dir:
+            self.__test_dirs = args.test_dir
+            global_config.debug_level = max(global_config.debug_level, 1) # 1 = internal validation
+        if args.test_name:
+            self.__run_test_name = args.test_name
+            global_config.debug_level = max(global_config.debug_level, 1) # 1 = internal validation
 
         self.__debug_preserve_breakpoint_path = args.debug_preserve_breakpoint_path
         if self.__debug_preserve_breakpoint_path:
@@ -634,6 +722,9 @@ class RokuDebug(object):
             sys.stderr = new_out
 
     def __print_startup_info(self):
+        needs_hrule = global_config.debug_level >= 1 or global_config.verbosity >= Verbosity.HIGH
+        if needs_hrule:
+            print('------------------------------------------------------')
         if (global_config.debug_level >= 1):
             print('debug:     debuglevel: {}'.format(global_config.debug_level))
             print('debug:     validation: internal validation enabled (debuglevel > 0)')
@@ -654,6 +745,17 @@ class RokuDebug(object):
             print('{}         targetpass: {}'.format(pre, self.options.target_pass))
             print('{}supported protocols: {}'.format(
                     pre, get_supported_protocols_str()))
+            if self.__lib_sources:
+                for lib_src in self.__lib_sources:
+                    print('{}         lib source: {}'.format(
+                        pre, lib_src))
+            if self.__test_dirs:
+                print('{}          test dirs: {}'.format(
+                    pre, ', '.join(self.__test_dirs)))
+            if self.__run_test_name:
+                print('{}      auto-run test: {}'.format(pre, self.__run_test_name))
+        if needs_hrule:
+            print('------------------------------------------------------')
 
         sys.stdout.flush()      # Helpful when stdout redirected
 
@@ -680,6 +782,24 @@ class RokuDebug(object):
             versionString += ' ' + rev_str
         return versionString
 
+    # Start the command-line interface without launching a channel
+    def __start_plain_cli(self, app_installer):
+        if self.__check_debug(2):
+            print('debug: start_plain_cli()')
+        self.__cli = CommandLineInterface(self.options.channel_file,
+            self.__lib_sources, self.__output_controller,
+            self.options.stop_target_on_launch, self.__test_mgr,
+            self.__debug_preserve_breakpoint_path)
+
+        with self.__lifecycle_lock:
+            self.__is_cli_running = True
+        try:
+            self.__cli.interact(app_installer, None)
+        finally:
+            with self.__lifecycle_lock:
+                self.__is_cli_running = False
+                self.__lifecycle_cond_var.notify_all()
+
     def __debug_channel(self, app_installer):
         if self.__check_debug(2):
             print('debug: debug_channel()')
@@ -687,11 +807,13 @@ class RokuDebug(object):
         # Create the debugger client
         dclient = None
         self.__cli = CommandLineInterface(self.options.channel_file,
-            self.__output_controller, self.options.stop_target_on_launch,
+            self.__lib_sources, self.__output_controller,
+            self.options.stop_target_on_launch, self.__test_mgr,
             self.__debug_preserve_breakpoint_path)
-        if self.__debug_no_sideload:
-            print('debug: NOT side-loading channel, because --debug-no-sideload')
-            self.__debugger_client = FakeDebuggerClient(self.options.target_ip)
+        if self.__debug_fake_connection:
+            if global_config.verbosity >= Verbosity.NORMAL:
+                print('info: NOT side-loading channel, because --debug-fake-connection')
+            self.__debugger_client = FakeDebuggerClient(self.__cli.update_received)
             dclient = self.__debugger_client
         else:
             app_installer.remove()
@@ -702,18 +824,31 @@ class RokuDebug(object):
             dclient = self.__debugger_client
             dclient.connect()
             self.__check_protocol_version(dclient, print_warnings=True)
-            if self.__check_debug(2):
-                if dclient.has_feature(ProtocolFeature.BAD_LINE_NUMBER_IN_STACKTRACE_BUG):
-                    print('debug: main: client has "bad line number in stacktrace" bug')
-                else:
-                    print('debug: main: client'
-                        ' DOES NOT have "bad line number in stacktrace" bug')
+
+        # Verify test is compatible with target
+        test = self.__test_mgr.get_current_test()
+        if test:
+            protocol_version = self.__debugger_client.get_protocol_version()
+            if protocol_version < test.min_protocol_version:
+                print('ERROR: Incompatible protocol, required={},actual={}'.format(\
+                    test.min_protocol_version.to_user_str(True),
+                    protocol_version.to_user_str(True)))
+                global_config.do_exit(1, 'Incompatible protocol')
+            del test, protocol_version
 
         # Start the interface
         if self.__check_debug(2):
             print('debug: stop on launch: {}'.format(
                 self.options.stop_target_on_launch))
-        self.__cli.interact(self.__debugger_client)
+
+        with self.__lifecycle_lock:
+            self.__is_cli_running = True
+        try:
+            self.__cli.interact(app_installer, self.__debugger_client)
+        finally:
+            with self.__lifecycle_lock:
+                self.__is_cli_running = False
+                self.__lifecycle_cond_var.notify_all()
 
     def __remove_channel(self, app_installer):
         app_installer.remove()
@@ -741,27 +876,69 @@ class RokuDebug(object):
         self.__tmp_files.append(fileInfo[1])
         return fileInfo[1]
 
-    def cleanup(self):
-        if self.__check_debug(2):
-            print('debug: RokuDebug:cleanup()')
-        with self.__shutdown_lock:
+    # Blocks until all daemon threads have exited
+    def shutdown(self):
+        try:
+            if self.__check_debug(2):
+                print('debug: RokuDebug:shutdown() start')
+            self.__shutdown_impl()
+            if self.__check_debug(2):
+                print('debug: RokuDebug:shutdown() complete')
+
+        # Catch and print any exception here, because if daemon threads
+        # have not yet exited, the python interpreter may freak out
+        # and choose to dump core rather than printing the exception.
+        except BaseException as e:
+            traceback.print_exc(file=sys.stderr)
+            print('INTERNAL ERROR: exception in shutdown(): {}'.format(e),
+                  file=sys.stderr)
+
+    # Blocks until all daemon threads have exited
+    def __shutdown_impl(self):
+        wait_for_cli_shutdown = False
+        with self.__lifecycle_lock:
             if self.__is_shut_down:
                 return
 
+            # Disable reporting errors that normally occur during shutdown
+            if self.__debugger_client:
+                self.__debugger_client.set_suppress_connection_errors(True)
+
+            # Shut down user interface
             if self.__cli:
-                self.__cli.shutdown()
+                self.__cli.shutdown_async()
                 self.__cli = None
+                wait_for_cli_shutdown = True
+
+            # Shut down the connection to the debug target
             # Close the debugger client explicitly, in case the user
             # interface has not been created (e.g., on a protocol mismatch)
             if self.__debugger_client:
                 self.__debugger_client.shutdown()
                 self.__debugger_client = None
+
+        if wait_for_cli_shutdown:
+            with self.__lifecycle_cond_var:
+                while self.__is_cli_running:
+                    self.__lifecycle_cond_var.wait(1.0)
+
+        with self.__lifecycle_lock:
+            # Clean up tmp files and whatnot
+            self.cleanup()
+            self.__is_shut_down = True
+
+    # Cleanup tmp files, etc
+    # This is often called twice during process exit: once while shutting
+    # down this debugger, and once as python atexit hook
+    def cleanup(self):
+        if self.__check_debug(2):
+            print('debug: RokuDebug: cleanup()')
+        with self.__lifecycle_lock:
             for tmp_file in self.__tmp_files:
                 if (os.path.exists(tmp_file)):
                     print("removing temp file: {:s}".format(tmp_file))
                     os.remove(tmp_file)
-
-            self.__is_shut_down = True
+            self.__tmp_files = []
 
     # Sets the exit code that will be returned by this process to the OS,
     # overriding any value sent to do_exit(). This should only be called
@@ -776,6 +953,36 @@ class RokuDebug(object):
         finally:
             if locked:
                 self._exit_cond_var.release()
+
+    # Always creates self.__test_mgr. If test directories have been specified,
+    # loads the tests in those directories.
+    def __init_test_mgr(self) -> None:
+        if self.__check_debug(1):   # 1 = validation
+            assert not self.__test_mgr
+
+        if self.__test_dirs:
+            self.__test_mgr = TestManager(self.get_tmp_dir_path())
+            if global_config.verbosity >= Verbosity.NORMAL:
+                print('info: loading tests')
+            for test_dir in self.__test_dirs:
+                self.__test_mgr.load_dir(test_dir)
+        else:
+            self.__test_mgr = NullTestManager()
+
+        if self.__run_test_name:
+            if not self.__test_mgr.set_current_test(self.__run_test_name):
+                print('FATAL: Test not found: {}'.format(self.__run_test_name))
+                raise ThreadExit(1)
+
+        if self.__test_mgr.get_current_test():
+            test = self.__test_mgr.get_current_test()
+            self.options.channel_file = self.__test_mgr.get_test_channel_package_path(test)
+            self.options.stop_target_on_launch = test.stop_channel_on_launch
+
+        if self.__check_debug(1): # 1 = validation
+            assert self.__test_mgr
+
+        return None
 
     # @return the new exit code
     # @see set_exit_code()
@@ -813,7 +1020,7 @@ class RokuDebug(object):
         if (signum == name_to_enum[SIGHUP_LITERAL]) or \
                 (signum == name_to_enum[SIGTERM_LITERAL]):
             if cli:
-                cli.shutdown()
+                cli.shutdown_async()
             else:
                 exitNow = True
         elif (signum == name_to_enum[SIGINT_LITERAL]) or \
@@ -841,7 +1048,7 @@ class RokuDebug(object):
 class _NullOutputController(object):
 
     def __init__(self):
-        super(_NullOutputController,self).__init__()
+        super().__init__()
         self.localerr = sys.stderr
         self.localout = sys.stdout
         self.targeterr = sys.stderr
@@ -870,19 +1077,63 @@ def set_exit_code(exit_code):
                 'set_exit_code() called with no RokuDebug instance')
 global_config.set_exit_code = set_exit_code     # make this available to all modules
 
+# NB: python's SystemExit exception only exits one thread, so it is
+# universally referred to as 'ThreadExit' in this set of scripts.
+#
+# This may be called on any thread and starts the shutdown sequence
+# to exit this process. On the main thread, this throws a ThreadExit
+# (AKA SystemExit) exception. On other threads, it sets the state and
+# returns so the main thread can take care of the shutdown.
+#
+# If a shutdown is already in progress, additional calls to this function
+# on non-main threads are ignored and assumed to be cascading errors (e.g.,
+# I/O errors after sockets have been closed).
+#
 # This deals with Python's goofy exit handling. There appears to be no way
 # for a thread other than main to cleanly exit this process. That's because
-# sys.exit() raises a SystemExit exception that is ignored, unless it is
-# raised on the only existing non-daemon thread. Using os._exit() is not
+# sys.exit() raises a ThreadExit exception that is ignored, unless it is
+# raised on the thread that called main(). Using os._exit() is not
 # a good idea, because that does not invoke shutdown hooks.
 # @see set_exit_code()
-def do_exit(exit_code, msg=None):
+def do_exit(exit_code, msg=None) -> None:
     global _rokudebug_main
+    exit_code_at_entry = exit_code
+    on_main_thread = threading.current_thread() is threading.main_thread()
+    if global_config.debug_level >= 2:
+        print('debug: do_exit({}) onmainthread:{}'.format(
+            exit_code_at_entry, on_main_thread))
 
-    # Print the message, if any
+    # Coordinate exit parameters with other threads
+    #
+    # If the exit lock cannot be acquired, proceed while unlocked
+    # That's scary but we cannot lock up permanently while exiting
 
-    if global_config.debug_level >= 1:
+    condition = _rokudebug_main._exit_cond_var
+    locked = condition.acquire(blocking=True, timeout=1)
+    try:
+        if global_config.debug_level >= 1: # 1 = internal validation
+            assert locked
+        if _rokudebug_main._exit_now:
+            # Shutdown has started
+            if global_config.debug_level >= 2 and msg:
+                print('debug: ignoring exit msg after shutdown started: {}'.format(msg))
+            msg = None  # Don't report cascading errors during shutdown
+            exit_code = _rokudebug_main._exit_code # exit code was already set
+        else:
+            # Shutdown has not started (let's start it)
+            _rokudebug_main._exit_now = True
+            _rokudebug_main._exit_code = exit_code
+
+    finally:
+        if locked:
+            condition.release()
+            locked = False
+
+    # Print the message, if provided
+
+    if global_config.debug_level >= 2:
         # Make output easier to read
+        # Don't do this at debug level 1, which is validation only
         sys.stdout.flush()
         sys.stderr.flush()
     if msg:
@@ -893,32 +1144,23 @@ def do_exit(exit_code, msg=None):
                 msg = 'FATAL: {}'.format(msg)
         print(msg, file=out)
 
-    # We want a lock but don't require it, to avoid potential signal-
-    # handling recursive lockups. A re-entrant lock does not always
-    # work properly with notify(), so just accept a failed lock.
+    if on_main_thread:
+        # This is the only thread that can actually exit this process
+        # raises ThreadExit exception
+        sys.exit(exit_code)
+global_config.do_exit = do_exit     # make this available to all modules
+
+def is_exiting() -> bool:
+    global _rokudebug_main
+
+    # If the exit lock cannot be acquired, proceed while unlocked
+    # That's scary but we cannot lock up permanently while exiting
     condition = _rokudebug_main._exit_cond_var
-    locked = condition.acquire(blocking=True, timeout=0.1)
+    locked = condition.acquire(blocking=True, timeout=1)
     try:
-        exit_code = _rokudebug_main._set_exit_code_nolock(exit_code)
-        _rokudebug_main._exit_now = True
-
-        # Exit
-
-        if threading.current_thread().ident == threading.main_thread().ident:
-            if global_config.debug_level >= 2:
-                print('debug: do_exit({}) on main thread'.format(exit_code))
-        else:
-            if global_config.debug_level >= 2:
-                print('debug: do_exit({}) on NON-main thread'.format(exit_code))
-            if locked:
-                condition.notify()
+        return _rokudebug_main._exit_now
+    finally:
         if locked:
             condition.release()
             locked = False
-        sys.exit(exit_code)
-        # if we could not lock and notify, rely on main thread's backup busy wait
-    except Exception:
-        if global_config.debug_level >= 1:
-            traceback.print_exc(sys.stderr)
-        os._exit(exit_code)     # Always guarantee an exit
-global_config.do_exit = do_exit     # make this available to all modules
+global_config.get_is_exiting = is_exiting

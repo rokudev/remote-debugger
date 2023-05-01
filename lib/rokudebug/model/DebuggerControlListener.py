@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 ########################################################################
-# File: DebuggerListener.py
+# File: DebuggerControlListener.py
 # Requires python v3.5.3 or later
 #
 # NAMING CONVENTIONS:
@@ -30,8 +30,12 @@
 
 from .DebuggerResponse import DebuggerUpdate
 from .DebuggerResponse import UpdateType
+from .Verbosity import Verbosity
 
 import sys, threading, traceback
+
+# SystemExit only exits the current thread, so call it by its real name
+ThreadExit = SystemExit
 
 global_config = getattr(sys.modules['__main__'], 'global_config', None)
 assert global_config    # verbosity, global debug_level
@@ -86,17 +90,29 @@ class DebuggerControlListener(object):
     # True, then processing continues. If the handler returns False,
     # the listening thread exits and no further updates will be
     # processed.
+    # @param suppress_connection_errors if True do not log connection errors
     def __init__(self, debugger_client, general_update_handler,
-                    io_update_handler):
+                    io_update_handler, suppress_connection_errors=False):
         self._debug_level = 0
         self._debugger_client = debugger_client
         self._general_update_handler = general_update_handler
         self._io_update_handler = io_update_handler
+
+        # private
         self.__pending_requests = []    # list of _PendingRequest
-        self.__thread = _ListenerThread(listener=self)
+        self.__thread = _ListenerThread(self, suppress_connection_errors)
         self.__pending_lock = threading.Lock()
 
         self.__thread.start()
+
+    # If suppress==True, connection errors are not reported to the user,
+    # may be changed at any time.
+    # This is useful during shutdown and for tests that test failure modes
+    def set_suppress_connection_errors(self, suppress) -> None:
+        self.__thread.set_suppress_connection_errors(suppress)
+
+    def get_suppress_connection_errors(self) -> bool:
+        return self.__thread.get_suppress_connection_errors()
 
     def has_pending_request(self):
         with self.__pending_lock:
@@ -116,7 +132,7 @@ class DebuggerControlListener(object):
             entry = _PendingRequest(request, allow_update, allowed_update_types)
             self.__pending_requests.append(entry)
             if self.__check_debug(3):
-                print('debug:ctl_lis: add pending request, count={},req={}'.format(
+                print('debug: ctl_lis: add pending request, count={},req={}'.format(
                     len(self.__pending_requests), entry))
 
     def get_pending_request(self, request_id, remove=False):
@@ -131,7 +147,7 @@ class DebuggerControlListener(object):
                         del pending_list[i]
                     break
         if self.__check_debug(3):
-            print('debug:ctl_lis: find pending by ID({})->{}'.format(
+            print('debug: ctl_lis: find pending by ID({})->{}'.format(
                                             request_id, request))
         return request
 
@@ -154,7 +170,7 @@ class DebuggerControlListener(object):
                             break
 
         if self.__check_debug(3):
-            print('debug:ctl_lis: find pending by update_type({})->{}'.format(
+            print('debug: ctl_lis: find pending by update_type({})->{}'.format(
                 update_type.name, request))
         return request
 
@@ -168,25 +184,46 @@ class DebuggerControlListener(object):
 
 class _ListenerThread(threading.Thread):
 
-    def __init__(self, listener):
+    def __init__(self, listener, suppress_connection_errors):
         super(_ListenerThread, self).__init__(daemon=True)
         self.name = 'DebuggerListener'      # Used by superclass
         self._debug_level = 0
         self.__listener = listener
 
+        # members below are protected with __lock
+        self.__lock = threading.Lock()
+        self.__suppress_connection_errors = suppress_connection_errors
+
+    def set_suppress_connection_errors(self, suppress):
+        with self.__lock:
+            self.__suppress_connection_errors = suppress
+
+    def get_suppress_connection_errors(self) -> bool:
+        with self.__lock:
+            return self.__suppress_connection_errors
+
     def run(self):
         try:
             self.__run_impl()
-        except SystemExit: raise
-        except: # yes, catch EVERYTHING
-            if self.__check_debug(1):
-                sys.stdout.flush()      # simplifies output when debugging
-            traceback.print_exc(file=sys.stderr)
-            global_config.do_exit(1, 'INTERNAL ERR: uncaught exception')
+        except Exception as e:
+            if self.__check_debug(2):
+                print('debug: ctl_lis: control connection closed: {}'.format(e))
+            is_connection_err = isinstance(e, OSError)
+            if not is_connection_err or not self.get_suppress_connection_errors():
+                # Don't show connection exceptions when the are suppressed
+                # Always show other exceptions
+                traceback.print_exc(file=sys.stderr)
+                global_config.do_exit(1, 'INTERNAL ERR: uncaught exception')
 
-    def __run_impl(self):
+        if not self.get_suppress_connection_errors():
+            if self.__check_debug(2):
+                print('debug: unexpected termination of control listener')
+            global_config.do_exit(1, 'INTERNAL ERROR: '\
+                    'unexpected termination of control listener')
+
+    def __run_impl(self) -> None:
         if self.__check_debug(2):
-            print('debug:ctl_lis: thread running')
+            print('debug: ctl_lis: thread running')
         listener = self.__listener
         dclient = listener._debugger_client
         general_update_handler = listener._general_update_handler
@@ -194,17 +231,30 @@ class _ListenerThread(threading.Thread):
         done = False
         while not done:
             update = DebuggerUpdate.read_update(dclient, listener)
+            if not update:
+                if self.__check_debug(2):
+                    print('debug: ctl_lis: EOF on socket, suppressioerrs={}',
+                          self.__suppress_connection_errors)
+                if not self.__suppress_connection_errors:
+                    if global_config.verbosity >= Verbosity.NORMAL:
+                        print('info: unexpected EOF on control socket')
+                        global_config.do_exit(1, 'Unexpected EOF on control socket')
+                done = True
+                break
+
             if self.__check_debug(5):
-                print('debug:ctl_lis: recvd msg: {}'.format(update))
+                print('debug: ctl_lis: recvd msg: {}'.format(update))
             if update.update_type == UpdateType.CONNECT_IO_PORT:
                 done = not io_update_handler(update)
             else:
                 done = not general_update_handler(update)
-            if done and self.__check_debug(2):
-                print('debug:ctl_lis: update handler says "quit"')
+            if done:
+                self.set_suppress_connection_errors(True)
+                if self.__check_debug(2):
+                    print('debug: ctl_lis: update handler says "quit"')
 
         if self.__check_debug(2):
-            print('debug:ctl_lis: thread exiting')
+            print('debug: ctl_lis: thread exiting')
 
     def __check_debug(self, min_level):
         lvl = max(global_config.debug_level, self._debug_level)
